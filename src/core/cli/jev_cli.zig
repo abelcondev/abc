@@ -8,20 +8,64 @@ const std = @import("std");
 const jev_config = @import("../decisions/jev_config.zig");
 const jev_contract = @import("../decisions/jev_contract.zig");
 const typesafe = @import("../../gateway/typesafe.zig");
+const calibration = @import("../decisions/calibration.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const Action = enum { status, on, off, key, forget, check };
+pub const Action = enum { status, on, off, key, forget, check, eval };
 
-pub const usage = "usage: fx jev [on|off|key|forget|check]\n";
+pub const usage = "usage: fx jev [on|off|key|forget|check|eval [stop|plan|action|ask|routing]]\n";
 
-pub fn parseAction(rest: []const [:0]const u8) ?Action {
-    if (rest.len == 0) return .status;
-    if (rest.len != 1) return null;
-    inline for (@typeInfo(Action).@"enum".fields) |field| {
-        if (std.mem.eql(u8, rest[0], field.name)) return @field(Action, field.name);
+pub const Parsed = struct {
+    action: Action,
+    /// `eval` gate filter.
+    gate: ?calibration.Gate = null,
+};
+
+pub fn parseAction(rest: []const [:0]const u8) ?Parsed {
+    if (rest.len == 0) return .{ .action = .status };
+    const action = std.meta.stringToEnum(Action, rest[0]) orelse return null;
+    if (action == .status) return null;
+    if (action == .eval and rest.len == 2) {
+        return .{ .action = .eval, .gate = calibration.parseGate(rest[1]) orelse return null };
     }
-    return null;
+    if (rest.len != 1) return null;
+    return .{ .action = action };
+}
+
+/// Runs the calibration cases and returns a report. Caller owns the text.
+/// `failures` receives the number of cases that did not match.
+pub fn evaluate(alloc: Allocator, config: jev_config.Config, api_key: []const u8, gate: ?calibration.Gate, failures: *usize) ![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const w = &out.writer;
+    var totals = std.EnumArray(calibration.Gate, [2]usize).initFill(.{ 0, 0 });
+    var current: ?calibration.Gate = null;
+    for (calibration.cases) |case| {
+        if (gate) |only| if (case.gate != only) continue;
+        if (current == null or current.? != case.gate) {
+            current = case.gate;
+            try w.print("\n{s}\n", .{@tagName(case.gate)});
+        }
+        const result = try calibration.run(arena, config, api_key, case);
+        const total = totals.getPtr(case.gate);
+        total[1] += 1;
+        if (result.passed) total[0] += 1 else failures.* += 1;
+        try w.print("  {s} {s}: {s}", .{ if (result.passed) "✓" else "✗", result.name, result.actual });
+        if (!result.passed) try w.print(" (expected {s})", .{result.expect});
+        if (result.answers.len != 0) try w.print("\n      {s}", .{result.answers});
+        try w.writeByte('\n');
+    }
+    try w.writeAll("\nSummary:");
+    inline for (@typeInfo(calibration.Gate).@"enum".fields) |field| {
+        const total = totals.get(@field(calibration.Gate, field.name));
+        if (total[1] != 0) try w.print(" {s} {d}/{d}", .{ field.name, total[0], total[1] });
+    }
+    try w.print(" (model {s})\n", .{config.model});
+    return out.toOwnedSlice();
 }
 
 pub const KeyStatus = union(enum) {
@@ -96,10 +140,14 @@ pub fn check(alloc: Allocator, config: jev_config.Config, api_key: []const u8) !
 }
 
 test "parseAction accepts the documented subcommands" {
-    try std.testing.expectEqual(Action.status, parseAction(&.{}).?);
-    try std.testing.expectEqual(Action.on, parseAction(&.{"on"}).?);
-    try std.testing.expectEqual(Action.check, parseAction(&.{"check"}).?);
+    try std.testing.expectEqual(Action.status, parseAction(&.{}).?.action);
+    try std.testing.expectEqual(Action.on, parseAction(&.{"on"}).?.action);
+    try std.testing.expectEqual(Action.check, parseAction(&.{"check"}).?.action);
+    try std.testing.expectEqual(calibration.Gate.plan, parseAction(&.{ "eval", "plan" }).?.gate.?);
+    try std.testing.expect(parseAction(&.{"eval"}).?.gate == null);
+    try std.testing.expect(parseAction(&.{ "eval", "nope" }) == null);
     try std.testing.expect(parseAction(&.{"enable"}) == null);
+    try std.testing.expect(parseAction(&.{"status"}) == null);
     try std.testing.expect(parseAction(&.{ "on", "now" }) == null);
 }
 

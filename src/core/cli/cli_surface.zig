@@ -2043,10 +2043,11 @@ fn runGithubWorkflow(
 }
 
 fn runJev(alloc: Allocator, deps: RunDeps, rest: []const [:0]const u8) !RunResult {
-    const action = jev_cli.parseAction(rest) orelse {
+    const parsed = jev_cli.parseAction(rest) orelse {
         try writeStderr(deps, jev_cli.usage);
         return .handled_failure;
     };
+    const action = parsed.action;
     switch (action) {
         .on, .off => {
             var outcome = config_runtime.setUserPreferences(alloc, .{ .jev_enabled = action == .on }) catch |err| {
@@ -2088,7 +2089,7 @@ fn runJev(alloc: Allocator, deps: RunDeps, rest: []const [:0]const u8) !RunResul
             try writeStdout(deps, if (removed) "Removed the saved Jev key.\n" else "No Jev key was saved.\n");
             return .handled_success;
         },
-        .status, .check => {},
+        .status, .check, .eval => {},
     }
     var config = try jev_config.load(alloc);
     defer config.deinit(alloc);
@@ -2108,6 +2109,18 @@ fn runJev(alloc: Allocator, deps: RunDeps, rest: []const [:0]const u8) !RunResul
         try writeStderr(deps, "fx jev: no key; run `fx jev key` or export " ++ jev_config.key_env ++ "\n");
         return .handled_failure;
     };
+    if (action == .eval) {
+        var failures: usize = 0;
+        const report = jev_cli.evaluate(alloc, config, api_key, parsed.gate, &failures) catch |err| {
+            const text = try std.fmt.allocPrint(alloc, "fx jev: eval failed: {s}\n", .{@errorName(err)});
+            defer alloc.free(text);
+            try writeStderr(deps, text);
+            return .handled_failure;
+        };
+        defer alloc.free(report);
+        try writeStdout(deps, report);
+        return if (failures == 0) .handled_success else .handled_failure;
+    }
     const summary = jev_cli.check(alloc, config, api_key) catch |err| {
         const text = try std.fmt.allocPrint(alloc, "fx jev: check failed: {s}\n", .{@errorName(err)});
         defer alloc.free(text);

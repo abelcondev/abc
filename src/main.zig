@@ -4388,6 +4388,7 @@ test {
     _ = @import("core/decisions/ask_gate.zig");
     _ = @import("core/decisions/routing.zig");
     _ = @import("core/decisions/turn_text.zig");
+    _ = @import("core/decisions/calibration.zig");
     _ = @import("core/cli/jev_cli.zig");
     _ = provider_runtime;
     _ = @import("acp/prompt.zig");
