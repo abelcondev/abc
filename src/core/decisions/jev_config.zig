@@ -51,7 +51,8 @@ pub const Config = struct {
     /// Minimum confidence and grounding for answering on the user's behalf.
     ask_threshold: f64 = 0.8,
     /// After a turn that changed files, flag decision records the uncommitted
-    /// changes contradict (only in workspaces with a decisions directory).
+    /// changes contradict (only in workspaces with a decisions directory and
+    /// SDD on).
     drift_gate: bool = true,
     /// Check file changes and shell commands against the request.
     action_gate: bool = false,

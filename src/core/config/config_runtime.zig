@@ -780,6 +780,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "permission",
         "additional_directories",
         "jev",
+        "sdd",
     }) |profile_key| {
         if (std.mem.eql(u8, key, profile_key)) return true;
     }
@@ -1075,6 +1076,21 @@ pub fn attemptProjectMcpMutation(
         .cleanup = store.takeFailureCleanup(),
     } };
     return .{ .outcome = outcome };
+}
+
+/// Saves `workspaces["<workspace_root>"].sdd.enabled` in the profile settings.
+pub fn setWorkspaceSdd(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    enabled: bool,
+) !CommitOutcome {
+    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    var store = try settings_store.Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+    return store.applyWorkspaceSddPatch(alloc, .{
+        .workspace_root = normalizeWorkspaceRoot(workspace_root),
+        .enabled = enabled,
+    });
 }
 
 pub fn setUserPreferences(

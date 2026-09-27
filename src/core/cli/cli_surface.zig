@@ -10,6 +10,9 @@ const cli_ask = @import("cli_ask.zig");
 const cli_replay = @import("cli_replay.zig");
 const jev_cli = @import("jev_cli.zig");
 const jev_config = @import("../decisions/jev_config.zig");
+const sdd_cli = @import("sdd_cli.zig");
+const sdd_mode = @import("../sdd/sdd_mode.zig");
+const drift_mod = @import("../decisions/drift.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
@@ -77,6 +80,7 @@ pub const Command = union(enum) {
     models: []const [:0]const u8,
     provider: []const [:0]const u8,
     jev: []const [:0]const u8,
+    sdd: []const [:0]const u8,
     doctor: []const [:0]const u8,
     teams: []const [:0]const u8,
     session: []const [:0]const u8,
@@ -709,6 +713,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
                 return .{ .session = args[1..] };
             }
             if (command_specs.matchesTopLevel(command_catalog, command, .slack)) return .{ .slack = args[1..] };
+            if (command_specs.matchesTopLevel(command_catalog, command, .sdd)) return .{ .sdd = args[1..] };
         },
         't' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .teams)) return .{ .teams = args[1..] };
@@ -1945,6 +1950,7 @@ fn runNonInteractiveWithDeps(
             return runSelfUpdate(alloc, cfg, deps);
         },
         .jev => |rest| return runJev(alloc, deps, rest),
+        .sdd => |rest| return runSdd(alloc, deps, rest),
         .replay => |rest| {
             const exit_code = try cli_replay.run(alloc, rest);
             return if (exit_code == 0) .handled_success else .handled_failure;
@@ -2131,6 +2137,39 @@ fn runJev(alloc: Allocator, deps: RunDeps, rest: []const [:0]const u8) !RunResul
     };
     defer alloc.free(summary);
     try writeStdout(deps, summary);
+    return .handled_success;
+}
+
+fn runSdd(alloc: Allocator, deps: RunDeps, rest: []const [:0]const u8) !RunResult {
+    const action = sdd_cli.parseAction(rest) orelse {
+        try writeStderr(deps, sdd_cli.usage);
+        return .handled_failure;
+    };
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(workspace_root);
+    if (action != .status) {
+        const enabled = action == .on;
+        var outcome = config_runtime.setWorkspaceSdd(alloc, workspace_root, enabled) catch |err| {
+            const text = try std.fmt.allocPrint(alloc, "fx sdd: could not update settings: {s}\n", .{@errorName(err)});
+            defer alloc.free(text);
+            try writeStderr(deps, text);
+            return .handled_failure;
+        };
+        outcome.deinit(alloc);
+        try writeStdout(deps, sdd_cli.savedMessage(enabled, sdd_mode.load(alloc, workspace_root)));
+        return .handled_success;
+    }
+    var config = try jev_config.load(alloc);
+    defer config.deinit(alloc);
+    const text = try sdd_cli.renderStatus(alloc, sdd_mode.load(alloc, workspace_root), .{
+        .workspace_root = workspace_root,
+        .records_dir = drift_mod.findDir(std.Io.Dir.cwd()),
+        .jev_enabled = config.enabled,
+        .drift_gate = config.drift_gate,
+        .enable_command = "fx sdd on",
+    });
+    defer alloc.free(text);
+    try writeStdout(deps, text);
     return .handled_success;
 }
 
