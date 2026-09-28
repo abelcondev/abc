@@ -1,207 +1,248 @@
-# fx (fork)
+# fx
 
-This fx is a model-agnostic coding agent CLI written in Zig. It is a hard fork of
-[fx](https://github.com/vercel-labs/fx) (commit `59bf437`) that works first-class
-with any OpenAI-compatible provider, such as DeepSeek, Qwen, Kimi, GLM, MiniMax,
-OpenRouter, Ollama, vLLM, and llama.cpp, without depending on the Vercel AI
-Gateway.
+**Español** | [English](README.en.md)
 
-It keeps the `fx` name, binary, `~/.fx` profile, and `FX_*` variables, so it
-replaces an installed upstream fx: uninstall the original before using it.
+Un agente de programación rápido para tu terminal que funciona con **el modelo
+que quieras**: DeepSeek, Qwen, Kimi, GLM, MiniMax, OpenRouter, OpenAI, Gemini,
+o un modelo local en Ollama, LM Studio, llama.cpp o vLLM.
 
-> Status: experimental, under active restructuring. See [PROPOSAL.md](PROPOSAL.md)
-> for the plan.
+fx es un fork de [fx](https://github.com/vercel-labs/fx) (commit `59bf437`)
+que elimina la dependencia del Vercel AI Gateway y añade **Jev**, un revisor
+independiente que mantiene al agente honesto.
 
-## Install (macOS)
+> Estado: experimental, en desarrollo activo. Ver [PROPOSAL.md](PROPOSAL.md).
+
+## Contenido
+
+- [Por qué fx](#por-qué-fx)
+- [Inicio rápido](#inicio-rápido)
+- [Cómo funciona](#cómo-funciona)
+- [Proveedores y modelos](#proveedores-y-modelos)
+- [Jev: el revisor del agente](#jev-el-revisor-del-agente)
+- [SDD: specs antes de los cambios grandes](#sdd-specs-antes-de-los-cambios-grandes)
+- [TDD: primero los tests](#tdd-primero-los-tests)
+- [Permisos y reglas del proyecto](#permisos-y-reglas-del-proyecto)
+- [Dónde vive la configuración](#dónde-vive-la-configuración)
+- [Referencia](#referencia)
+
+## Por qué fx
+
+- **Tu modelo, tu factura.** Usa cualquier proveedor compatible con OpenAI, o
+  todo en local. Sin gateway en el medio.
+- **Tool calls que funcionan de verdad.** Un lector de streams tolerante maneja
+  las rarezas de los modelos que no son de OpenAI (finish reasons extraños,
+  `[DONE]` que falta, tool deltas sin índice) que rompen los tool calls y los
+  subagentes en otros agentes.
+- **Una segunda opinión en cada turno.** Jev comprueba que los cambios grandes
+  tengan un plan, que "listo" signifique listo y que cada afirmación esté
+  respaldada por la salida real de las herramientas.
+- **Specs siempre al día.** SDD (opcional) mantiene una carpeta `sdd/` liviana
+  con reglas y propuestas de cambio, y avisa cuando el código las contradice.
+- **Nativo y rápido.** Un solo binario en Zig que arranca en milisegundos. Las
+  keys se guardan en el Keychain de macOS.
+
+## Inicio rápido
+
+**1. Instalar** (macOS, Apple Silicon o Intel):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/abelcondev/fx/main/install.sh | sh
 ```
 
-Installs the latest release for Apple Silicon or Intel into `~/.local/bin`
-(`FX_INSTALL_DIR` changes it, `FX_VERSION=v0.1.0` pins a release). Other
-platforms can build from source. Later, `fx update` installs the newest
-release over the running binary.
+Se instala en `~/.local/bin`. `FX_INSTALL_DIR` cambia la carpeta y
+`FX_VERSION=v0.1.0` fija una versión. En otras plataformas,
+[compila desde el código](#compilar-desde-el-código). fx usa el nombre `fx` y
+la carpeta `~/.fx`, así que primero desinstala el fx original de Vercel.
 
-Open `fx` in a project and run `/provider`: pick a preset, paste its API key
-when asked (saved in the macOS Keychain), then choose a model with `/model`.
-
-## Set up fx
-
-A working setup takes five steps. Each can be checked on its own.
-
-**1. Choose a provider and a model.** Save the provider's key once (macOS
-Keychain) and pick the default model:
+**2. Conectar un proveedor** (la key se guarda en el Keychain):
 
 ```bash
-fx login deepseek            # or: fx login qwen, fx login openrouter, ...
-fx                           # then /model inside the session
+fx login deepseek        # o qwen, openrouter, moonshot, zai, ...
 ```
 
-Inside a session, `/provider` switches providers and `/model` models and
-reasoning effort. `fx status` prints the active provider, model, credentials
-and permission mode.
+Los modelos locales no necesitan key: `fx provider ollama` (o `lmstudio`,
+`llamacpp`, `vllm`).
 
-**2. Choose what fx may do without asking.** `/permissions` switches between
-`ask` (confirm sensitive actions), `auto` (a security review decides) and
-`full-access` (no fx checks). The choice is saved in your profile;
-`--auto` or `--full-access` on `fx ask` apply to one run.
-
-**3. Tell the agent about your project.** fx reads `AGENTS.md` at the
-workspace root, plus `~/.fx/AGENTS.md` for rules that apply everywhere. Keep
-it short: what the app is, the stack, and conventions the code does not show
-(language to reply in, package manager, where tests live).
-
-**4. Turn on Jev** (optional, recommended). Jev checks the agent's decisions:
-a plan before large changes, answers backed by evidence, questions it can
-settle, and subagent models. Get a key from [TypeSafe AI](https://docs.typesafe.ai):
+**3. A trabajar:**
 
 ```bash
-fx jev key                   # paste the TypeSafe key (Keychain)
-fx jev check                 # one live call to confirm it works
-fx jev on                    # enable it for new sessions
-fx jev                       # status: gates, thresholds, key source
+cd mi-proyecto
+fx                                  # sesión interactiva
+fx ask "explica este repositorio"   # un pedido, sin sesión
 ```
 
-**5. Turn on spec-driven development per project** (optional, needs Jev for
-its checks). From the project directory:
+Eso es todo. Lo demás es opcional: elige un modelo con `/model`, activa
+[Jev](#jev-el-revisor-del-agente) y activa [SDD](#sdd-specs-antes-de-los-cambios-grandes)
+por proyecto.
+
+Para actualizar más adelante: `fx update`.
+
+## Cómo funciona
+
+```
+   tú ──► fx (loop del agente) ──► tu modelo (DeepSeek, Qwen, local, ...)
+              │    ▲
+              │    └── resultados: archivos, shell, web, subagentes
+              ▼
+        permisos         ← qué puede hacer el agente sin preguntarte
+        Jev (opcional)   ← ¿hay un plan? ¿está realmente terminado?
+        SDD (opcional)   ← ¿este cambio necesita una spec o una propuesta?
+```
+
+El modelo hace el trabajo. fx ejecuta las herramientas, aplica los permisos y,
+si los activas, le pide a Jev y a SDD que revisen el trabajo en momentos clave.
+
+## Proveedores y modelos
+
+### Elegir un proveedor
 
 ```bash
-fx sdd on                    # this workspace only; others stay free
-fx sdd tdd on                # optional: behavior changes start with a failing test
-fx sdd                       # status: specs, open changes, checks that run
+fx login <preset>        # guarda la key y selecciona ese proveedor
+fx provider <preset>     # cambia de proveedor
+fx logout <preset>       # olvida la key
+fx status                # muestra proveedor, modelo, credenciales y permisos
 ```
 
-Then work as usual. Small fixes go straight through, a change to an existing
-rule updates the spec in the same change, and a feature or a change to data,
-money, auth or a new screen stops for a short proposal in `sdd/changes/` that
-you approve by replying "yes" or with `/sdd approve`. Close a finished change
-with `/sdd done`. Commit the `sdd/` folder with the code so specs and changes
-travel with the project. The sections below explain each part.
+Dentro de una sesión, `/provider` lista los presets y cambia entre ellos.
 
-**Where settings live**
-
-| What | Where | Override |
-| --- | --- | --- |
-| Provider keys, Jev key | macOS Keychain (`fx login`, `fx jev key`) | `DEEPSEEK_API_KEY`, `DASHSCOPE_API_KEY`, `TYPESAFE_API_KEY`, ... |
-| Provider, model, permissions, Jev | `~/.fx/settings.json` | `FX_PROVIDER`, `FX_MODEL`, `FX_PERMISSION_MODE`, `FX_JEV=on\|off` |
-| SDD and TDD, per project | `~/.fx/settings.json` → `workspaces["<path>"].sdd` | `FX_SDD=on\|off` |
-| Project defaults safe to commit | `<project>/.fx.json` | |
-| Sessions and Jev's decision log | `~/.fx/sessions/<id>/` (`decisions.jsonl`) | |
-
-The status line shows the permission mode, the model and `sdd` while SDD is on.
-Calls a Jev or SDD check holds appear as "Held" in the transcript.
-
-## Build
-
-Requires Zig 0.16.0.
-
-```bash
-zig build                              # builds zig-out/bin/fx
-zig build test                         # runs the unit tests
-zig build test -Dtest-filter="preset"  # runs a subset
-./zig-out/bin/fx                      # starts an interactive session
-```
-
-`fx upgrade` and automatic upgrades are disabled; rebuild from source instead.
-
-## Use a provider preset
-
-Built-in presets need only the provider's API key in the environment:
+También puedes saltarte `login` y exportar la key. Una variable exportada gana
+sobre una guardada:
 
 ```bash
 export DEEPSEEK_API_KEY=...
-FX_PROVIDER=deepseek ./zig-out/bin/fx ask "explain this repository"
-
-export DASHSCOPE_API_KEY=...
-FX_PROVIDER=qwen FX_MODEL=qwen3-coder-plus ./zig-out/bin/fx
+FX_PROVIDER=deepseek fx
 ```
 
-Or save the key once instead of exporting it (macOS Keychain, or an
-owner-only file under `~/.fx/provider-keys` elsewhere):
+Si no hay proveedor elegido, fx usa el primer preset cuya variable de key esté
+definida.
 
-```bash
-./zig-out/bin/fx login deepseek      # prompts for the key, then selects deepseek
-echo "$KEY" | ./zig-out/bin/fx login qwen
-./zig-out/bin/fx logout deepseek
-```
+### Presets incluidos
 
-An exported variable takes precedence over a saved key. With no provider
-selected, fx picks the first preset whose key variable is exported.
-
-Inside a session, `/provider` lists the presets and switches between them, and
-`fx models` lists the models the provider reports at `GET /models`.
-
-| Preset | API key variable | Endpoint |
+| Preset | Variable de la key | Endpoint |
 | --- | --- | --- |
-| `deepseek` | `DEEPSEEK_API_KEY` | api.deepseek.com (`deepseek-flash`, `deepseek-v4-pro`; verified end to end) |
-| `qwen`, `qwen-cn` | `DASHSCOPE_API_KEY` | DashScope compatible mode (intl / China) |
-| `qwen-plan` | `QWEN_TOKEN_PLAN_API_KEY` | Model Studio Token Plan, Singapore (`sk-sp-…` plan key; qwen3.8, GLM and DeepSeek models; verified end to end) |
-| `moonshot`, `moonshot-cn` | `MOONSHOT_API_KEY` | Kimi (intl / China) |
+| `deepseek` | `DEEPSEEK_API_KEY` | api.deepseek.com (`deepseek-flash`, `deepseek-v4-pro`; probado de punta a punta) |
+| `qwen`, `qwen-cn` | `DASHSCOPE_API_KEY` | DashScope modo compatible (internacional / China) |
+| `qwen-plan` | `QWEN_TOKEN_PLAN_API_KEY` | Model Studio Token Plan, Singapur (key de plan `sk-sp-…`; modelos qwen3.8, GLM y DeepSeek; probado de punta a punta) |
+| `moonshot`, `moonshot-cn` | `MOONSHOT_API_KEY` | Kimi (internacional / China) |
 | `zai`, `zhipu` | `ZAI_API_KEY`, `ZHIPUAI_API_KEY` | GLM (Z.ai / BigModel) |
 | `minimax` | `MINIMAX_API_KEY` | api.minimax.io |
 | `openrouter` | `OPENROUTER_API_KEY` | openrouter.ai |
-| `openai`, `anthropic`, `gemini`, `xai`, `mistral` | `<NAME>_API_KEY` | vendor OpenAI-compatible endpoints |
-| `groq`, `together`, `fireworks`, `siliconflow` | `<NAME>_API_KEY` | vendor OpenAI-compatible endpoints |
-| `ollama`, `lmstudio`, `llamacpp`, `vllm` | none | localhost default ports |
+| `openai`, `anthropic`, `gemini`, `xai`, `mistral` | `<NOMBRE>_API_KEY` | endpoints compatibles con OpenAI de cada proveedor |
+| `groq`, `together`, `fireworks`, `siliconflow` | `<NOMBRE>_API_KEY` | endpoints compatibles con OpenAI de cada proveedor |
+| `ollama`, `lmstudio`, `llamacpp`, `vllm` | ninguna | localhost, puertos por defecto |
 
-Models that `GET /models` reports with `context_window`, `max_output_tokens`,
-`effort.supported_levels` or `input_modalities` pick those up automatically.
-Preset endpoints and model ids follow each provider's public documentation and
-may drift; override a preset by defining a provider with the same name.
+Los endpoints y los ids de modelo siguen la documentación pública de cada
+proveedor y pueden cambiar. Para ajustar uno, define un proveedor con el mismo
+nombre (ver abajo).
 
-## Web search
-
-The `web_search` tool works with any provider once a search API is configured:
-
-| Backend | Variable |
-| --- | --- |
-| Tavily | `TAVILY_API_KEY` (supports allowed/blocked domains) |
-| Brave Search API | `BRAVE_API_KEY` |
-| SearXNG (self-hosted, JSON format enabled) | `FX_SEARXNG_URL=http://host:8080` |
-
-With several set, they are preferred in that order; `FX_WEB_SEARCH_BACKEND`
-pins one. `web_fetch` works without any configuration.
-
-## Jev decisions
-
-[Jev](https://docs.typesafe.ai) is TypeSafe AI's decision model. It does not
-write code; it answers typed questions with calibrated probabilities. fx uses
-it as an independent check on the agent, next to whatever model does the work.
+### Elegir un modelo
 
 ```bash
-fx jev key       # paste a TypeSafe API key (saved in the Keychain)
-fx jev check     # one live call to confirm the key works
-fx jev on        # enable for new sessions (writes jev.enabled)
-fx jev eval      # run the labeled calibration cases against live Jev
-fx jev           # show status
-fx jev off
+fx models                # modelos que reporta el proveedor
+fx --model deepseek-v4-pro --effort high
 ```
 
-Inside a session, `/jev` shows the status and `/jev on` or `/jev off` switches
-it for the current session and saves the choice.
+Dentro de una sesión, `/model` elige el modelo y su nivel de razonamiento, y la
+elección se guarda. `FX_MODEL` lo cambia solo para esa shell. Si el `GET /models`
+del proveedor reporta `context_window`, `max_output_tokens`, niveles de
+razonamiento o tipos de entrada, fx los toma automáticamente.
 
-**Plan before changes.** Before the first file change (`write_file` or
-`edit_file`) of a turn, Jev rates how substantial the request is. Trivial and
-small requests pass. For a substantial one, the change is held until the
-agent has stated a plan with steps and checkable acceptance criteria that
-covers the request without unrequested extra work. A turn is held at most
-twice, then changes go through.
+### Añadir tu propio proveedor
 
-**Answering settled questions.** When the agent asks a multiple-choice
-question in a session, Jev answers it only when the request or what the agent
-already found settles the answer (for example, a pinned dependency). Choices
-that are a matter of preference, or that the user asked to make, still go to
-the user. The agent is told the answer came from Jev so it can mention it.
+Cualquier endpoint compatible con OpenAI sirve. Agrégalo a `~/.fx/settings.json`:
 
-**Action check (opt-in, `gates.action`).** Before each file change or shell
-command, Jev checks that it is a step toward the request and does not delete,
-overwrite, publish, or reach outside the project in a way the user did not ask
-for. Held calls return the reason to the agent. It complements, never
-replaces, the permission system, and adds about half a second per call.
+```jsonc
+{
+  "providers": {
+    "mi-proveedor": {
+      "protocol": "openai-chat-completions",
+      "base_url": "https://api.ejemplo.com/v1",
+      "auth": { "type": "bearer", "env": "MI_PROVEEDOR_API_KEY" },
+      "default_model": "mi-modelo"
+    }
+  }
+}
+```
 
-**Model routing (opt-in, `routing`).** When the agent starts a temporary
-subagent without naming a model, Jev picks one of your routes for the task:
+Luego `fx provider mi-proveedor`. `http://` sin TLS funciona para localhost y
+redes privadas (RFC 1918, Tailscale, `.local`). Todos los campos están en
+[Campos del proveedor](#campos-del-proveedor).
+
+## Jev: el revisor del agente
+
+[Jev](https://docs.typesafe.ai) es el modelo de decisiones de TypeSafe AI.
+**No escribe código.** Responde preguntas cortas y tipadas ("¿este plan está
+completo?", "¿cada afirmación está respaldada por un resultado de herramienta?")
+con probabilidades calibradas. fx le pregunta en momentos clave de cada turno,
+así un segundo modelo, independiente, revisa el trabajo del modelo principal.
+
+### Qué hace Jev en un turno
+
+```
+ tú: "agrega pagos parciales"
+   │
+   ▼
+ ┌─────────────────────── turno del agente ───────────────────────┐
+ │                                                                │
+ │  el agente te hace una pregunta                                │
+ │     └─► ASK: Jev la responde si el contexto ya la resuelve,    │
+ │              si no, te llega a ti                              │
+ │                                                                │
+ │  primer cambio de archivos del turno                           │
+ │     ├─► PLAN: ¿pedido grande? se frena hasta que el agente     │
+ │     │         escriba un plan con pasos y criterios            │
+ │     └─► SDD:  (si está activo) ruta fix / spec / change        │
+ │                                                                │
+ │  cada edición o comando (opcional)                             │
+ │     └─► ACTION: ¿es parte de la tarea? ¿sin daños no pedidos?  │
+ │                                                                │
+ │  subagente sin modelo asignado (opcional)                      │
+ │     └─► ROUTING: Jev elige un modelo liviano o potente         │
+ │                                                                │
+ │  el agente dice "listo"                                        │
+ │     ├─► STOP:  ¿el trabajo está hecho? ¿las afirmaciones       │
+ │     │          tienen respaldo en la salida de herramientas?   │
+ │     │          si no, el agente sigue una vez y lo verifica    │
+ │     └─► DRIFT: (si SDD está activo) ¿el código contradice una  │
+ │                regla de la spec? el agente la actualiza        │
+ └────────────────────────────────────────────────────────────────┘
+   │
+   ▼
+ respuesta
+```
+
+En palabras simples:
+
+| Chequeo | Qué evita | Por defecto |
+| --- | --- | --- |
+| **Plan** | Cambios grandes sin un plan claro. Los pedidos chicos pasan. Frena como máximo dos veces por turno. | activo |
+| **Ask** | Que te pregunte cosas que el código ya responde (por ejemplo, una versión fijada). Las preferencias te siguen llegando a ti. | activo |
+| **Stop** | "¡Listo!" cuando no está listo, o afirmaciones ("los tests pasan") que ninguna salida muestra. | activo |
+| **Drift** | Specs y registros de decisiones desactualizados tras un cambio. Solo con SDD activo. | activo |
+| **Ruteo SDD** | Cambios grandes sin propuesta. Solo con SDD activo. | activo |
+| **Action** | Borrar, sobrescribir, publicar o salir del proyecto sin que lo pidas. Suma ~0,5 s por llamada. | inactivo |
+| **Routing** | Usar un modelo caro para una tarea trivial de un subagente. | inactivo |
+
+Jev no reemplaza el sistema de permisos, se suma a él. Las llamadas frenadas
+aparecen como "Held" en el transcript, no como "Failed". Si Jev no responde o
+no hay key, el turno sigue normal.
+
+### Configurar Jev
+
+Consigue una key en [TypeSafe AI](https://docs.typesafe.ai) y luego:
+
+```bash
+fx jev key       # pega la key (se guarda en el Keychain)
+fx jev check     # una llamada real para confirmar que funciona
+fx jev on        # lo activa para las sesiones nuevas
+fx jev           # estado: chequeos, umbrales, origen de la key
+fx jev off       # lo desactiva
+```
+
+Dentro de una sesión, `/jev on` y `/jev off` lo cambian y guardan la elección.
+
+**Opcional: ruteo de modelos.** Deja que Jev elija el modelo del subagente
+según la tarea:
 
 ```json
 "jev": {
@@ -213,92 +254,44 @@ subagent without naming a model, Jev picks one of your routes for the task:
 }
 ```
 
-`light` and `heavy` have built-in descriptions; other route names need a
-`description`. Routes need at least two entries and models from the active
-provider.
+**Opcional: drift en CI.** `fx jev drift [<rango-git>]` compara un diff con tus
+specs o registros de decisiones y termina con error si alguno puede estar
+desactualizado.
 
-**Completion check.** When the agent finishes a turn that asked for work, fx
-sends Jev the request, the final answer and the turn's tool results. If Jev
-cannot confirm that the requested work was carried out, or that every claim in
-the answer is backed by a tool result, the agent continues once with the
-reasons and is asked to verify before answering again. Questions, small talk
-and answers that report a blocker or ask the user pass through. If Jev is
-unreachable or has no key, the turn finishes normally.
+Cada decisión de Jev queda registrada en `~/.fx/sessions/<id>/decisions.jsonl`.
+Todas las opciones están en [Configuración de Jev](#configuración-de-jev).
 
-`fx jev eval [stop|plan|action|ask|routing|sdd]` runs labeled cases through the
-same questions, code and thresholds as the live gates and prints each answer,
-so threshold or model changes can be checked before use.
+## SDD: specs antes de los cambios grandes
 
-**Spec drift.** `fx jev drift [<git-range>] [--dir <path>]` checks a diff
-(default: uncommitted changes) against the project's decision records
-(`sdd/specs`, where each `## ` rule is checked on its own, or `sdd/decisions`,
-`docs/decisions`, `docs/adr` or `decisions`, one Markdown file each, front
-matter `title`/`status`/`description` optional). Jev first picks
-the decisions the diff touches, then reads them and flags the ones the change
-contradicts. It exits non-zero when any decision may be out of date, so it can
-run in CI.
+SDD (desarrollo guiado por specs) mantiene una descripción pequeña y viva de
+cómo se comporta tu proyecto, y hace que el agente proponga los cambios grandes
+antes de programarlos. **Los arreglos chicos pasan directo, sin papeleo.**
 
-The same check runs at the end of a session turn that changed files, when SDD
-is on for the workspace (see below) and it has a decisions directory
-(`gates.drift`, default on). If the uncommitted changes contradict a record,
-the agent is asked to update the record (or fix the code) before answering.
-Each record is flagged once per session.
+Viene desactivado y se activa **por proyecto**. Necesita Jev activo.
 
-Every decision is recorded in `~/.fx/sessions/<id>/decisions.jsonl` with Jev's
-answers, the threshold and the outcome (the state sent to Jev is not stored).
-
-Settings live under `jev` in `~/.fx/settings.json` only; project `.fx.json`
-files cannot set them.
-
-| Field | Meaning |
-| --- | --- |
-| `enabled` | Turn Jev decisions on (default `false`) |
-| `model` | Jev model (default `jev-latest`) |
-| `gates.ask` | Let Jev answer questions the context already settles (default `true`) |
-| `gates.plan` | Require a plan before changes on substantial requests (default `true`) |
-| `gates.drift` | Flag decision records a turn's changes contradict (default `true`) |
-| `gates.sdd` | With SDD on, route the first file change to fix, spec or change (default `true`) |
-| `gates.action` | Check file changes and shell commands (default `false`) |
-| `gates.stop` | Run the completion check (default `true`) |
-| `thresholds.ask` | Minimum confidence and grounding for answering (default `0.8`) |
-| `thresholds.plan` | Minimum probability the plan checks must reach (default `0.5`) |
-| `thresholds.action` | Unrequested-damage probability that holds an action (default `0.6`) |
-| `routing.<name>` | `model`, optional `effort`, and `description` for a subagent route |
-| `thresholds.stop` | Minimum probability each completion check must reach (default `0.5`) |
-
-`TYPESAFE_API_KEY`, `FX_JEV=on|off`, `FX_JEV_MODEL` and `FX_JEV_BASE_URL`
-override the saved values.
-
-## Spec-driven development
-
-SDD is fx's spec-driven development process. It is off by default, so fx works
-freely in every workspace until you turn it on for one:
+### Activarlo
 
 ```bash
-fx sdd                   # status: specs, open changes and the checks that run
-fx sdd on                # turn it on here (writes workspaces["<path>"].sdd.enabled)
+cd mi-proyecto
+fx sdd on        # solo este proyecto; los demás siguen libres
+fx sdd           # estado: specs, cambios abiertos, chequeos activos
 fx sdd off
-fx sdd new <slug>        # write sdd/changes/<yyyy-mm-dd>-<slug>.md (proposed)
-fx sdd approve [<name>]  # proposed -> approved
-fx sdd done [<name>]     # approved -> done
-fx sdd tdd off|on|strict # test-first behavior changes (writes sdd.tdd)
 ```
 
-Inside a session, `/sdd` accepts the same subcommands. The status line shows
-`sdd` while it is on.
+La barra de estado muestra `sdd` mientras está activo. Haz commit de la carpeta
+`sdd/` junto con tu código.
 
-The process keeps two kinds of Markdown files under `sdd/`:
+### Qué crea
 
 ```
 sdd/
-  specs/reservas.md                     # how the system behaves today
-  changes/2026-09-27-pagos-parciales.md # one file per change
+├── specs/                        cómo se comporta el sistema HOY
+│   └── reservas.md               cada título "## " es una regla
+└── changes/                      un archivo por cambio propuesto
+    └── 2026-09-27-pagos-parciales.md
 ```
 
-A spec holds only current behavior. Every `## ` heading is one rule, and the
-text under it describes the rule. A change file has a flat front matter that
-only fx edits, then Why, What, an optional Wireframe for a new screen, Tasks
-and Notes:
+Un archivo de cambio es corto. fx maneja el front matter:
 
 ```markdown
 ---
@@ -314,69 +307,141 @@ specs: [reservas]
 ## Notes
 ```
 
-With Jev on, fx sorts each turn's first file change outside `sdd/` into one of
-three routes, so small work skips the paperwork:
+### Cómo se clasifica un pedido
 
-| Route | When | What happens |
-| --- | --- | --- |
-| fix | No rule changes | Nothing to write |
-| spec | A small change to existing rules | The agent is told which rules to update in the same change |
-| change | Schema, money, auth, the AI pipeline, a new screen, or substantial work | Code changes are held until a change file is approved; files under `sdd/` stay writable |
+Antes del primer cambio de archivos, Jev pone el pedido en una de tres rutas:
 
-A vague request, or one Jev cannot classify, is sent back so the agent asks
-you which route it is. Saying "no hagas propuesta" or "skip the spec" makes it
-a fix, and so does a request that only ships finished work (commit, push, open
-a PR, release notes). Files outside the workspace, such as a PR body in `/tmp`,
-are never routed. A proposed change is approved by `fx sdd approve`, `/sdd approve`, or a
-reply that approves it ("sí, dale", "si yes, y abre el PR"), even in a turn
-that changes no code. With several proposals open, the one your reply names is
-approved, else the newest. Once a change is approved, code changes go
-through. Approving and closing are yours: when the agent runs `fx sdd approve`
-or `fx sdd done` itself, fx holds the command. The agent ticks the change's
-tasks as it works, and after the first turn that changes code under an approved
-change it is asked once to write the behavior as rules in `sdd/specs`, so the
-specs grow with each change. Writing files under `sdd/` never needs a plan, and
-the completion check lets a turn end while a change waits for your approval.
-Calls a gate holds show as "Held" in the transcript, not "Failed". `fx jev eval sdd` runs the routing against labeled cases.
-
-**Test-first.** `fx sdd tdd on` (or `/sdd tdd on`) makes behavior changes
-test-first while SDD is on: spec and change routes, and fixes that repair a
-bug. Before the first source change, the turn must have changed a test and run
-it failing; before the answer, a test run must pass after the last source
-change. Both come from the turn's own tool results, including a runner's
-`1 fail` summary when the command is piped. Jev then checks that the changed
-tests would fail without the requested behavior. `fx sdd tdd strict` also
-requires every changed rule to be cited by a test, and `fx sdd` reports how
-many rules are:
-
-```ts
-// spec: reservas › Saldo is the outstanding balance
-test("subtracts payments", () => { ... });
+```
+                       tu pedido
+                           │
+          ┌────────────────┼───────────────────┐
+          ▼                ▼                   ▼
+         FIX              SPEC               CHANGE
+   ninguna regla      cambio chico a     schema, dinero, auth,
+   cambia             una regla que      pipeline de IA, pantalla
+                      ya existe          nueva, o trabajo grande
+          │                │                   │
+          ▼                ▼                   ▼
+    se programa     código + actualizar   propuesta en sdd/changes/,
+    directo         la regla en el        espera tu "sí" y
+                    mismo cambio          después se programa
 ```
 
-A rule whose heading ends in `(manual)`, or a change with `tdd: manual` in its
-front matter, is checked in the running app instead. fx recognizes common
-runners (`bun test`, `npm test`, `pytest`, `go test`, `cargo test`,
-`zig build test` and others); set `"test": "<command>"` under `sdd` in the
-settings for anything else. A fix or spec update that grows past 8 source files
-is held once so the agent can propose a change instead.
+- Los pedidos ambiguos vuelven a ti como pregunta.
+- Di "no hagas propuesta" (o "skip the spec") para forzar un fix.
+- Entregar trabajo terminado (commit, push, PR, notas de versión) nunca se
+  clasifica.
 
-After turns that change files, the Jev spec drift check compares the
-uncommitted changes with each rule in `sdd/specs` (or with the files in
-`sdd/decisions`, `docs/decisions`, `docs/adr` or `decisions` when there are no
-specs) and asks the agent to update the rules the code now contradicts. With
-SDD off, nothing is routed or checked automatically; `fx jev drift` still runs
-on demand.
+### Vida de un cambio
 
-The setting lives in `~/.fx/settings.json` only, per workspace, with an
-optional top-level `"sdd": {"enabled": true}` default for every workspace.
-Project `.fx.json` files cannot turn it on. `FX_SDD=on|off` overrides the saved
-value for one shell or CI run.
+```
+  proposed ──(tú apruebas)──► approved ──(tú cierras)──► done
+     │                           │
+  el agente escribe       el agente programa, marca tareas
+  la propuesta            y escribe las reglas nuevas en sdd/specs
+```
 
-## Configure a connection
+Aprueba respondiendo "sí" / "sí, dale", o con `/sdd approve`. Cierra con
+`/sdd done`. Solo tú apruebas y cierras: si el agente corre esos comandos por su
+cuenta, fx los frena.
 
-Settings live in `~/.fx/settings.json` (per project: `.fx.json`). Environment
-variables use the `FX_` prefix.
+```bash
+fx sdd new <slug>          # crea un archivo de cambio a mano
+fx sdd approve [<nombre>]  # proposed → approved
+fx sdd done [<nombre>]     # approved → done
+```
+
+Después de los turnos que cambian archivos, el chequeo de drift compara el
+código con cada regla de `sdd/specs` y le pide al agente que actualice las
+reglas que el código ya contradice.
+
+## TDD: primero los tests
+
+TDD es un complemento de SDD. Con él, los cambios de comportamiento (rutas spec
+y change, y arreglos de bugs) tienen que empezar con un test que falle.
+
+```bash
+fx sdd tdd on       # primero el test
+fx sdd tdd strict   # además: cada regla cambiada debe citarse en un test
+fx sdd tdd off
+```
+
+### Qué exige fx
+
+```
+  1. ROJO     cambiar un test, correrlo y verlo FALLAR
+                  │   (los cambios al código se frenan hasta que pase esto)
+                  ▼
+  2. CÓDIGO   cambiar el código
+                  │
+                  ▼
+  3. VERDE    correr los tests otra vez y verlos PASAR
+                  │   (la respuesta se frena hasta que pase esto)
+                  ▼
+  4. JEV      ¿el test nuevo fallaría sin este comportamiento?
+```
+
+fx lo lee de la salida de las herramientas del propio turno, así que el agente
+no puede solo decirlo. Reconoce `bun test`, `npm test`, `pytest`, `go test`,
+`cargo test`, `zig build test` y otros. Para cualquier otro, define
+`"test": "<comando>"` dentro de `sdd` en la configuración.
+
+En modo **strict**, cada test cita la regla que cubre:
+
+```ts
+// spec: reservas › Saldo es el monto pendiente
+test("resta los pagos", () => { ... });
+```
+
+Una regla cuyo título termina en `(manual)`, o un cambio con `tdd: manual`, se
+comprueba en la app corriendo. Un fix o actualización de spec que crece a más
+de 8 archivos de código se frena una vez para que el agente proponga un cambio.
+
+## Permisos y reglas del proyecto
+
+**Permisos.** `/permissions` cambia entre:
+
+| Modo | Comportamiento |
+| --- | --- |
+| `ask` | Pide confirmación para acciones sensibles |
+| `auto` | Decide una revisión de seguridad |
+| `full-access` | Sin chequeos de fx |
+
+`fx ask --auto` o `--full-access` aplican a una sola ejecución.
+
+**Reglas del proyecto.** fx lee `AGENTS.md` en la raíz del proyecto, más
+`~/.fx/AGENTS.md` para reglas que aplican en todos lados. Mantenlo corto: qué
+es la app, el stack y las convenciones que el código no muestra (idioma de
+respuesta, gestor de paquetes, dónde viven los tests).
+
+## Dónde vive la configuración
+
+| Qué | Dónde | Se sobrescribe con |
+| --- | --- | --- |
+| Keys de proveedores y de Jev | Keychain de macOS (`fx login`, `fx jev key`) | `DEEPSEEK_API_KEY`, `DASHSCOPE_API_KEY`, `TYPESAFE_API_KEY`, ... |
+| Proveedor, modelo, permisos, Jev | `~/.fx/settings.json` | `FX_PROVIDER`, `FX_MODEL`, `FX_PERMISSION_MODE`, `FX_JEV=on\|off` |
+| SDD y TDD, por proyecto | `~/.fx/settings.json` → `workspaces["<ruta>"].sdd` | `FX_SDD=on\|off` |
+| Valores del proyecto que se pueden commitear | `<proyecto>/.fx.json` | |
+| Sesiones y registro de decisiones de Jev | `~/.fx/sessions/<id>/` (`decisions.jsonl`) | |
+
+Fuera de macOS, las keys guardadas van a un archivo privado en
+`~/.fx/provider-keys`. La configuración de Jev y SDD vive solo en tu perfil: el
+`.fx.json` de un proyecto no puede activarlos.
+
+## Referencia
+
+### Compilar desde el código
+
+Requiere Zig 0.16.0.
+
+```bash
+zig build                              # genera zig-out/bin/fx
+zig build test                         # corre los tests unitarios
+zig build test -Dtest-filter="preset"  # corre un subconjunto
+./zig-out/bin/fx                       # abre una sesión interactiva
+```
+
+### Campos del proveedor
 
 ```jsonc
 {
@@ -396,37 +461,92 @@ variables use the `FX_` prefix.
 }
 ```
 
-| Field | Meaning |
+| Campo | Significado |
 | --- | --- |
-| `reasoning_format` | How `--effort` is sent: `reasoning_effort` (default), `thinking`, `thinking_effort` (DeepSeek V4), `enable_thinking`, `openrouter`, or `none` |
-| `model_metadata.<id>.reasoning_efforts` | Efforts the model accepts; enables the effort picker for it |
-| `default_model` | Model used when `FX_MODEL` and saved preferences do not pick one |
-| `merge_system_messages` | Join adjacent system messages (default `true`) |
-| `strict_stream` | Require strict OpenAI stream framing (default `false`) |
-| `tool_choice_mode` | `send` forwards `tool_choice`; `omit` (default) leaves it out |
+| `reasoning_format` | Cómo se envía `--effort`: `reasoning_effort` (por defecto), `thinking`, `thinking_effort` (DeepSeek V4), `enable_thinking`, `openrouter` o `none` |
+| `model_metadata.<id>.reasoning_efforts` | Niveles que acepta el modelo; activa el selector de razonamiento |
+| `default_model` | Modelo que se usa cuando ni `FX_MODEL` ni las preferencias guardadas eligen uno |
+| `merge_system_messages` | Une mensajes de sistema contiguos (por defecto `true`) |
+| `strict_stream` | Exige el formato de stream estricto de OpenAI (por defecto `false`) |
+| `tool_choice_mode` | `send` envía `tool_choice`; `omit` (por defecto) no lo envía |
 
-Plain `http://` endpoints are accepted for localhost and private-network hosts
-(RFC 1918, Tailscale CGNAT, `.local`).
+### Configuración de Jev
 
-## What changed from fx
+Dentro de `jev` en `~/.fx/settings.json`:
 
-- A lenient stream reader tolerates common OpenAI-compatible deviations
-  (tool calls finished with `stop`, missing `[DONE]`, unindexed tool deltas,
-  vendor finish reasons) while still rejecting unknown tools and malformed
-  arguments. This is what made tool calls and subagents fail on custom models.
-- Reasoning controls, provider presets, and model discovery for configured
-  providers.
-- The Codex and Grok subscription providers were removed.
-- Provider API keys are saved per preset in the Keychain (`FX_PROVIDER_KEY_<id>`)
-  or `~/.fx/provider-keys`.
+| Campo | Significado |
+| --- | --- |
+| `enabled` | Activa las decisiones de Jev (por defecto `false`) |
+| `model` | Modelo de Jev (por defecto `jev-latest`) |
+| `gates.ask` | Deja que Jev responda preguntas que el contexto ya resuelve (por defecto `true`) |
+| `gates.plan` | Exige un plan antes de cambios en pedidos grandes (por defecto `true`) |
+| `gates.drift` | Marca registros de decisiones que el cambio contradice (por defecto `true`) |
+| `gates.sdd` | Con SDD activo, clasifica el primer cambio como fix, spec o change (por defecto `true`) |
+| `gates.action` | Revisa cambios de archivos y comandos de shell (por defecto `false`) |
+| `gates.stop` | Corre el chequeo de finalización (por defecto `true`) |
+| `thresholds.ask` | Confianza y respaldo mínimos para responder (por defecto `0.8`) |
+| `thresholds.plan` | Probabilidad mínima que deben alcanzar los chequeos del plan (por defecto `0.5`) |
+| `thresholds.action` | Probabilidad de daño no pedido que frena una acción (por defecto `0.6`) |
+| `thresholds.stop` | Probabilidad mínima de cada chequeo de finalización (por defecto `0.5`) |
+| `routing.<nombre>` | `model`, `effort` opcional y `description` de una ruta de subagente |
 
-## Upstream documentation
+`TYPESAFE_API_KEY`, `FX_JEV=on|off`, `FX_JEV_MODEL` y `FX_JEV_BASE_URL`
+sobrescriben los valores guardados.
 
-The original fx README is kept at [docs/UPSTREAM_README.md](docs/UPSTREAM_README.md)
-for reference. Parts of it (Vercel login, gateway routing, Slack) do not apply to
-this fork.
+Rutas: `light` y `heavy` traen descripción incluida; otros nombres necesitan
+`description`. El ruteo necesita al menos dos rutas con modelos del proveedor
+activo.
 
-## License
+Fuentes de drift: `sdd/specs` (cada regla `## ` se revisa por separado), o un
+archivo Markdown por decisión en `sdd/decisions`, `docs/decisions`, `docs/adr`
+o `decisions` (front matter `title`/`status`/`description` opcional). Cada
+registro se marca una vez por sesión.
 
-Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE). This fork is not affiliated
-with or endorsed by Vercel, Inc.
+`fx jev eval [stop|plan|action|ask|routing|sdd]` corre casos etiquetados con las
+mismas preguntas y umbrales que los chequeos reales, para probar cambios de
+umbral o de modelo antes de usarlos.
+
+### Configuración de SDD
+
+Por proyecto en `~/.fx/settings.json` → `workspaces["<ruta>"].sdd`: `enabled`,
+`tdd` (`off`, `on`, `strict`) y `test` (un comando de tests propio). Un
+`"sdd": {"enabled": true}` en el nivel superior define el valor por defecto
+para todos los proyectos. `FX_SDD=on|off` lo sobrescribe para una shell o una
+ejecución de CI.
+
+### Búsqueda web
+
+La herramienta `web_search` funciona con cualquier proveedor una vez que
+configuras una API de búsqueda:
+
+| Backend | Variable |
+| --- | --- |
+| Tavily | `TAVILY_API_KEY` (admite dominios permitidos/bloqueados) |
+| Brave Search API | `BRAVE_API_KEY` |
+| SearXNG (propio, con formato JSON activado) | `FX_SEARXNG_URL=http://host:8080` |
+
+Si hay varios, se prefieren en ese orden; `FX_WEB_SEARCH_BACKEND` fija uno.
+`web_fetch` funciona sin configuración.
+
+### Qué cambió respecto al fx original
+
+- Un lector de streams tolerante acepta las desviaciones comunes de las APIs
+  compatibles con OpenAI (tool calls terminados con `stop`, `[DONE]` que falta,
+  tool deltas sin índice, finish reasons propios) y sigue rechazando
+  herramientas desconocidas y argumentos mal formados.
+- Presets de proveedores, controles de razonamiento y descubrimiento de modelos
+  para proveedores configurados.
+- Decisiones con Jev y los procesos SDD y TDD.
+- Se quitaron los proveedores por suscripción de Codex y Grok.
+- Las keys se guardan por preset en el Keychain (`FX_PROVIDER_KEY_<id>`) o en
+  `~/.fx/provider-keys`.
+- `fx upgrade` y las actualizaciones automáticas están desactivadas; usa
+  `fx update`.
+
+El README original se conserva en [docs/UPSTREAM_README.md](docs/UPSTREAM_README.md).
+Partes de él (login de Vercel, ruteo por gateway, Slack) no aplican a este fork.
+
+## Licencia
+
+Apache-2.0. Ver [LICENSE](LICENSE) y [NOTICE](NOTICE). Este fork no está
+afiliado ni respaldado por Vercel, Inc.
