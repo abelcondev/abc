@@ -15,7 +15,7 @@ replaces an installed upstream fx: uninstall the original before using it.
 ## Install (macOS)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/abelcondev/abc/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/abelcondev/fx/main/install.sh | sh
 ```
 
 Installs the latest release for Apple Silicon or Intel into `~/.local/bin`
