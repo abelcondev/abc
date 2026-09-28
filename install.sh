@@ -1,14 +1,14 @@
 #!/bin/sh
 # Install fx (macOS, Apple Silicon or Intel) from GitHub Releases.
 #
-#   curl -fsSL https://raw.githubusercontent.com/abelcondev/abc/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/abelcondev/fx/main/install.sh | sh
 #
 # Environment:
 #   FX_VERSION      release tag to install (default: latest), e.g. v0.1.0
 #   FX_INSTALL_DIR  destination directory (default: ~/.local/bin)
 set -eu
 
-repo="abelcondev/abc"
+repo="abelcondev/fx"
 version="${FX_VERSION:-latest}"
 install_dir="${FX_INSTALL_DIR:-$HOME/.local/bin}"
 
