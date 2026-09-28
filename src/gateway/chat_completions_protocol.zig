@@ -297,6 +297,14 @@ fn validate_arguments(alloc: Allocator, text: []const u8) Error!void {
     if (try types.ToolArgumentIntegrity.classifyFunctionInput(alloc, text) != .valid) return error.InvalidToolArguments;
 }
 
+fn classify_lenient_arguments(alloc: Allocator, text: []const u8) Error!types.ToolArgumentIntegrity {
+    check_json_depth(text) catch |err| switch (err) {
+        error.JsonTooDeep => return .malformed_json,
+        else => |failure| return failure,
+    };
+    return types.ToolArgumentIntegrity.classifyFunctionInput(alloc, text);
+}
+
 fn validate_history(alloc: Allocator, messages: []const types.ChatMessage) Error!void {
     var pending: std.StringHashMapUnmanaged([]const u8) = .empty;
     defer pending.deinit(alloc);
@@ -314,7 +322,8 @@ fn validate_history(alloc: Allocator, messages: []const types.ChatMessage) Error
             if (call.provenance != .fx_local or call.provider_result != null) return error.UnsupportedToolProvenance;
             if (call.id.len == 0 or call.final_identity != .valid) return error.InvalidToolCallId;
             try validate_name(call.name);
-            if (call.argument_integrity != .valid) return error.InvalidToolArguments;
+            // A call fx rejected as malformed already carries `{}` arguments and a
+            // failed tool result; replaying it lets the model see and repair it.
             if (call.arguments_json.len > max_history_arguments_bytes) return error.ArgumentsTooLarge;
             try validate_arguments(alloc, call.arguments_json);
             const entry = try pending.getOrPut(alloc, call.id);
@@ -1269,10 +1278,28 @@ pub const Reducer = struct {
         if (self.refusal_seen) return error.Refused;
         if ((reason == .tool_calls) != (self.tools.items.len != 0)) return error.InconsistentFinishReason;
         if (self.choice == .required and self.tools.items.len == 0) return error.RequiredToolMissing;
-        for (self.tools.items) |tool| {
+        const integrities = try self.alloc.alloc(types.ToolArgumentIntegrity, self.tools.items.len);
+        defer self.alloc.free(integrities);
+        const diagnostics = try self.alloc.alloc(?types.ToolArgumentDiagnostic, self.tools.items.len);
+        defer self.alloc.free(diagnostics);
+        for (self.tools.items, integrities, diagnostics) |*tool, *integrity, *diagnostic| {
             if (tool.id == null) return error.InvalidToolCallId;
             if (!self.known_name(tool.name.items)) return error.InvalidToolName;
-            try validate_arguments(self.alloc, tool.arguments.items);
+            integrity.* = .valid;
+            diagnostic.* = null;
+            if (!self.limits.lenient) {
+                try validate_arguments(self.alloc, tool.arguments.items);
+                continue;
+            }
+            // Lenient servers sometimes emit broken argument JSON. Like the
+            // gateway client, fx replaces it with `{}` and marks the call so the
+            // runtime returns a tool failure the model can retry, instead of
+            // failing the whole turn.
+            integrity.* = try classify_lenient_arguments(self.alloc, tool.arguments.items);
+            if (integrity.* == .valid) continue;
+            if (integrity.* == .malformed_json) diagnostic.* = try types.ToolArgumentDiagnostic.diagnose(self.alloc, tool.arguments.items);
+            tool.arguments.clearRetainingCapacity();
+            try tool.arguments.appendSlice(self.alloc, "{}");
         }
         const provider_state = self.reasoning_state() catch |err| switch (err) {
             error.WriteFailed => return error.OutOfMemory,
@@ -1288,7 +1315,7 @@ pub const Reducer = struct {
             }
             calls.deinit(self.alloc);
         }
-        for (self.tools.items) |*tool| {
+        for (self.tools.items, integrities, diagnostics) |*tool, integrity, diagnostic| {
             // finish() is terminal: ownership moves to the result and the
             // emptied accumulators cost nothing at reducer deinit.
             const id = tool.id.?;
@@ -1298,7 +1325,7 @@ pub const Reducer = struct {
             errdefer self.alloc.free(name);
             const arguments = try tool.arguments.toOwnedSlice(self.alloc);
             errdefer self.alloc.free(arguments);
-            try calls.append(self.alloc, .{ .id = id, .name = name, .arguments_json = arguments });
+            try calls.append(self.alloc, .{ .id = id, .name = name, .arguments_json = arguments, .argument_integrity = integrity, .argument_diagnostic = diagnostic });
         }
         const content = if (self.content.items.len != 0) try self.content.toOwnedSlice(self.alloc) else null;
         errdefer if (content) |text| self.alloc.free(text);
@@ -3020,11 +3047,35 @@ test "lenient chat completions still rejects unknown tools and malformed argumen
         test_tools_finish,
         "[DONE]",
     }));
-    try std.testing.expectError(error.InvalidToolArguments, test_lenient_result(&.{
-        "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"a\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}",
-        test_tools_finish,
-        "[DONE]",
-    }));
+}
+
+test "lenient chat completions marks malformed arguments instead of failing the turn" {
+    for ([_][]const u8{ "{\\\"path\\\":", "[]", "{}junk" }, [_]types.ToolArgumentIntegrity{ .malformed_json, .non_object_json, .malformed_json }) |arguments, expected| {
+        const chunk = try std.fmt.allocPrint(std.testing.allocator, "{{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"a\",\"function\":{{\"name\":\"read_file\",\"arguments\":\"{s}\"}}}},{{\"index\":1,\"id\":\"b\",\"function\":{{\"name\":\"read_file\",\"arguments\":\"{{}}\"}}}}]}}}}]}}", .{arguments});
+        defer std.testing.allocator.free(chunk);
+        var result = try test_lenient_result(&.{ chunk, test_tools_finish, "[DONE]" });
+        defer result.deinit(std.testing.allocator);
+        const calls = result.completed.completion.tool_calls;
+        try std.testing.expectEqual(@as(usize, 2), calls.len);
+        try std.testing.expectEqual(expected, calls[0].argument_integrity);
+        try std.testing.expectEqualStrings("{}", calls[0].arguments_json);
+        try std.testing.expectEqual(expected == .malformed_json, calls[0].argument_diagnostic != null);
+        try std.testing.expectEqual(types.ToolArgumentIntegrity.valid, calls[1].argument_integrity);
+    }
+}
+
+test "chat completions replays calls fx marked malformed" {
+    const alloc = std.testing.allocator;
+    var request = test_request();
+    const call: types.ToolCall = .{ .id = "call-1", .name = "read_file", .arguments_json = "{}", .argument_integrity = .malformed_json };
+    var messages = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = &.{call} },
+        .{ .role = .tool, .tool_call_id = call.id, .content = "invalid arguments" },
+    };
+    request.messages = &messages;
+    const body = try build_request(alloc, request, .{});
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.find(u8, body, "\"call-1\"") != null);
 }
 
 test "lenient chat completions stream ends without DONE only after finish_reason" {
