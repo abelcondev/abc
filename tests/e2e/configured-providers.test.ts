@@ -38,6 +38,39 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 45000);
 
+  test("malformed tool arguments return a tool error the model can repair", async () => {
+    let calls = 0;
+    const f = fixture(body => {
+      calls++;
+      if (calls === 1) {
+        const chunks = [
+          { id: "chat-tool", model: body.model, choices: [{ index: 0, delta: { tool_calls: [
+            { index: 0, id: "call-bad", type: "function", function: { name: "read_file", arguments: "{\"path\": \"note.txt\"" } },
+            { index: 1, id: "call-good", type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: "note.txt" }) } },
+          ] }, finish_reason: null }] },
+          { id: "chat-tool", model: body.model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+        ];
+        return new Response(chunks.map(value => `data: ${JSON.stringify(value)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+      }
+      return completion(body.model, "recovered");
+    });
+    try {
+      writeFileSync(join(f.workspace, "note.txt"), "fixture contents");
+      const result = await runFx(["ask", "--json", "--no-save", "Read note.txt"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(JSON.parse(result.stdout).output).toBe("recovered");
+      const chats = f.requests.filter(request => request.path === "/v1/chat/completions");
+      expect(chats).toHaveLength(2);
+      const messages = chats[1].body.messages;
+      const toolTurn = messages.find((message: any) => message.role === "assistant" && message.tool_calls?.length);
+      expect(toolTurn.tool_calls.map((call: any) => call.function.arguments)).toEqual(["{}", JSON.stringify({ path: "note.txt" })]);
+      const results = messages.filter((message: any) => message.role === "tool");
+      expect(results.map((message: any) => message.tool_call_id)).toEqual(["call-bad", "call-good"]);
+      expect(results[1].content).toContain("fixture contents");
+      expect(results[0].content).not.toContain("fixture contents");
+    } finally { f.close(); }
+  }, 25000);
+
   test("reasoning-only completion after silent tools reaches the continuation request", async () => {
     let calls = 0;
     const f = fixture(body => {
