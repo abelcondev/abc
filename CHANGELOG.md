@@ -1,8 +1,25 @@
 # fx
 
-## 0.3.1
+## 0.3.2
 
 <!-- release:start -->
+
+**Spec-driven development gets out of the way when you ship: opening a PR no longer asks for a proposal, and your "yes" always counts.**
+
+### Improvements
+
+- **Setup guide:** The README now walks through setting up fx in five steps (provider and model, permissions, `AGENTS.md`, Jev, SDD and TDD) and lists where each setting lives and which variable overrides it.
+
+### Bug Fixes
+
+- **Shipping is not a change:** Committing, pushing, opening a PR or writing release notes goes straight through, and files written outside the project (such as a PR body in `/tmp`) are never held.
+- **Approvals in any turn:** A reply such as "si yes" approves the pending proposal even when that turn only pushes or opens a PR, and a "yes" with extra instructions still counts.
+- **The right proposal:** With several proposals open, fx approves the one your reply names, or the newest.
+- **Bugs versus tweaks:** Changing how something looks or adding a filter is no longer treated as a bug, so test-first mode does not ask for a regression test.
+<!-- release:end -->
+
+## 0.3.1
+
 
 **Smoother spec-driven development: fewer interruptions while a change waits for your approval, and specs that fill in as changes land.**
 
@@ -17,7 +34,6 @@
 - **Waiting for approval:** A turn that stops to ask you to approve a change, or to ask you anything, is no longer sent back by the completion check.
 - **Proposals need no plan:** Writing a proposal or spec under `sdd/` is no longer held for a plan.
 - **Approval stays yours:** When the agent runs `fx sdd approve` or `fx sdd done` itself, fx holds the command; your reply approves the change, and you close it with `/sdd done`.
-<!-- release:end -->
 
 ## 0.3.0
 
