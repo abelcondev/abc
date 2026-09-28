@@ -254,7 +254,7 @@ Y una prueba E2E real por preset con el binario (`./zig-out/bin/fx ask`), como e
 - Variables `ABC_*` → `FX_*`. El alias que acepta `ABC_X` además de `FX_X` (`src/core/shared/io.zig:415`) se elimina.
 - Keys guardadas: servicio de Keychain `ABC_PROVIDER_KEY_<id>` → `FX_PROVIDER_KEY_<id>` y `~/.abc/provider-keys/` → `~/.fx/provider-keys/`. Migrar las keys existentes una sola vez (leer la ubicación vieja si la nueva no existe) o volver a cargarlas con `/provider`.
 - Comandos y textos (`abc login`, `abc update`, ayuda, README, instalador curl, workflow de release de macOS).
-- Repo en GitHub: puede seguir siendo `abelcondev/abc` o renombrarse; no afecta al binario.
+- Repo en GitHub: renombrado a `abelcondev/fx` (2026-09-27); GitHub redirige el nombre anterior.
 
 Se hace como un commit acotado, con `zig build test` en verde y `./zig-out/bin/fx` probado, igual que el resto de las fases.
 

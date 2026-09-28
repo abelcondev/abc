@@ -244,7 +244,7 @@ const LocalSurfaceOptions = struct {
 
 const self_update_script =
     \\set -eu
-    \\current="$1"; install_dir="$2"; repo="abelcondev/abc"
+    \\current="$1"; install_dir="$2"; repo="abelcondev/fx"
     \\latest="$(curl -fsSL "https://api.github.com/repos/$repo/releases/latest" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)"
     \\if [ -z "$latest" ]; then echo "fx update: could not read the latest release" >&2; exit 1; fi
     \\if [ "$latest" = "v$current" ]; then echo "fx $current is up to date."; exit 0; fi
