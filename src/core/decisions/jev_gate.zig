@@ -77,6 +77,9 @@ pub const Gate = struct {
     /// change files without asking Jev again.
     sdd_change: ?sdd_gate.Verdict = null,
     sdd_incomplete_held: bool = false,
+    /// Jev already judged this turn whether the user's message approves the
+    /// pending proposal.
+    sdd_approval_checked: bool = false,
     /// Decision files already flagged by the drift check. Owned keys.
     drift_reported: std.StringHashMapUnmanaged(void) = .empty,
 
@@ -184,6 +187,7 @@ pub const Gate = struct {
         self.sdd_settled = false;
         self.sdd_change = null;
         self.sdd_incomplete_held = false;
+        self.sdd_approval_checked = false;
     }
 
     fn newEntry(self: *const Gate, gate: []const u8, invocation: hooks.Invocation, threshold: f64) decision_log.Entry {
@@ -367,9 +371,10 @@ pub const Gate = struct {
         var arena_state = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        // Proposals and specs are always writable; only code waits.
+        // Proposals and specs are always writable, and files outside the
+        // workspace (a PR body in /tmp) are not the project's code.
         if (toolPath(arena, input.arguments_json)) |path| {
-            if (sdd_layout.isSddPath(root_path, path)) return .continue_;
+            if (sdd_layout.isSddPath(root_path, path) or !sdd_layout.isInsideWorkspace(root_path, path)) return .continue_;
         }
         const io = io_mod.getIo();
         var root = try std.Io.Dir.cwd().openDir(io, root_path, .{});
@@ -384,7 +389,7 @@ pub const Gate = struct {
             decision_log.append(self.alloc, entry);
             return .continue_;
         }
-        const proposed = sdd_layout.firstWithStatus(changes, .proposed);
+        const proposed = sdd_layout.pendingProposal(changes, &.{ input.user_request, input.assistant_text });
         if (self.sdd_change) |verdict| {
             // Already routed to change this turn: hold until approved.
             entry.outcome = "hold";
@@ -411,6 +416,7 @@ pub const Gate = struct {
             return .continue_;
         };
         defer response.deinit();
+        if (with_proposal) self.sdd_approval_checked = true;
         const verdict = sdd_gate.evaluate(arena, &response, rules.len, with_proposal) catch |err| {
             self.logIncomplete(&entry, err);
             if (self.sdd_incomplete_held) {
@@ -649,12 +655,18 @@ pub const Gate = struct {
             .interactive, .ask => {},
             .acp, .subagent => return .allow,
         }
-        if (!input.can_continue) return .allow;
         if (std.mem.trim(u8, input.user_request, " \t\r\n").len == 0) return .allow;
 
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        if (input.invocation.turn_id) |turn| self.resetForTurn(turn);
+        if (self.config.sdd_gate) {
+            self.checkApprovalAtStop(input) catch |err| {
+                debug_trace.logf("jev", "approval check failed err={s}", .{@errorName(err)});
+            };
+        }
+        if (!input.can_continue) return .allow;
         return self.checkCompletion(input) catch |err| {
             debug_trace.logf("jev", "completion gate failed err={s}", .{@errorName(err)});
             return .allow;
@@ -720,6 +732,44 @@ pub const Gate = struct {
                 return .{ .continue_once = self.lend(try completion_gate.feedback(self.alloc, failed)) };
             },
         }
+    }
+
+    /// A turn that approves the proposal but changes no code (pushing, opening
+    /// a PR, editing `sdd/`) never reaches the route check, so the approval
+    /// is read here instead. Never blocks the turn.
+    fn checkApprovalAtStop(self: *Gate, input: hooks.StopInput) !void {
+        if (self.sdd_approval_checked or self.sdd_change != null) return;
+        self.sdd_approval_checked = true;
+        const root_path = input.invocation.scope.workspace_root;
+        if (self.sdd_turn_mode == null) self.sdd_turn_mode = sdd_mode.load(self.alloc, root_path);
+        if (!self.sdd_turn_mode.?.enabled) return;
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const io = io_mod.getIo();
+        var root = try std.Io.Dir.cwd().openDir(io, root_path, .{});
+        defer root.close(io);
+        const context = try turnContext(arena, input.user_request, input.assistant_text, input.turn_messages);
+        const proposed = sdd_layout.pendingProposal(try sdd_layout.listChanges(arena, root), context) orelse return;
+        var entry = self.newEntry("sdd", input.invocation, sdd_gate.approval_threshold);
+        const state = try sdd_gate.approvalState(self.alloc, input.user_request, proposed.body);
+        defer self.alloc.free(state);
+        var response = self.consult(&entry, state, &sdd_gate.approval_questions) orelse return;
+        defer response.deinit();
+        const p = response.noul(sdd_gate.approves_id) orelse {
+            self.logIncomplete(&entry, error.IncompleteJevAnswer);
+            return;
+        };
+        if (p < sdd_gate.approval_threshold) {
+            entry.outcome = "skip";
+            entry.detail = "reply does not approve the proposal";
+            decision_log.append(self.alloc, entry);
+            return;
+        }
+        try sdd_layout.setStatus(self.alloc, root, proposed.file, .approved);
+        entry.outcome = "approved";
+        entry.detail = proposed.file;
+        decision_log.append(self.alloc, entry);
     }
 
     /// Holds `fx sdd approve|done` run by the agent: approval comes from the
@@ -857,6 +907,20 @@ fn isSddWrite(input: hooks.PreToolUseInput) bool {
     return sdd_layout.isSddPath(input.invocation.scope.workspace_root, path);
 }
 
+/// Texts that may name the proposal a turn is about, highest priority
+/// first: the request, the answer, then the agent's tool call arguments.
+/// Tool results are left out: listing `sdd/changes` names every proposal.
+fn turnContext(arena: Allocator, user_request: []const u8, assistant_text: []const u8, messages: []const types.ChatMessage) ![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    try list.appendSlice(arena, &.{ user_request, assistant_text });
+    for (messages) |message| {
+        if (message.role != .assistant) continue;
+        if (message.content) |content| try list.append(arena, content);
+        for (message.tool_calls) |call| try list.append(arena, call.arguments_json);
+    }
+    return list.items;
+}
+
 /// Whether the turn changed a file outside `sdd/`.
 fn changedCode(workspace_root: []const u8, messages: []const types.ChatMessage) bool {
     var buf: [16 * 1024]u8 = undefined;
@@ -866,7 +930,7 @@ fn changedCode(workspace_root: []const u8, messages: []const types.ChatMessage) 
             if (!plan_gate.isFileChange(call.name)) continue;
             var fixed = std.heap.FixedBufferAllocator.init(&buf);
             const path = toolPath(fixed.allocator(), call.arguments_json) orelse continue;
-            if (!sdd_layout.isSddPath(workspace_root, path)) return true;
+            if (sdd_layout.isInsideWorkspace(workspace_root, path) and !sdd_layout.isSddPath(workspace_root, path)) return true;
         }
     }
     return false;

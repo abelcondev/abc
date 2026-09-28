@@ -218,6 +218,25 @@ pub fn firstWithStatus(changes: []const Change, status: Status) ?Change {
     return null;
 }
 
+/// The proposal a conversation is about: the first text in `context`
+/// (highest priority first) that names a proposed change's file or slug
+/// picks it; otherwise the newest proposed change.
+pub fn pendingProposal(changes: []const Change, context: []const []const u8) ?Change {
+    for (context) |text| {
+        for (changes) |change| {
+            if (change.status != .proposed) continue;
+            const stem = std.mem.trimEnd(u8, change.file, ".md");
+            const slug = if (stem.len > 11 and stem[10] == '-') stem[11..] else stem;
+            if (std.mem.find(u8, text, stem) != null or std.mem.find(u8, text, slug) != null) return change;
+        }
+    }
+    var newest: ?Change = null;
+    for (changes) |change| {
+        if (change.status == .proposed) newest = change;
+    }
+    return newest;
+}
+
 /// Returns `text` with its front matter `status` set to `status`, adding a
 /// front matter when there is none. Caller owns the result.
 pub fn withStatus(alloc: Allocator, text: []const u8, status: Status) ![]u8 {
@@ -342,6 +361,22 @@ pub fn isSddPath(workspace_root: []const u8, path: []const u8) bool {
     return std.mem.startsWith(u8, relative, root_dir ++ "/");
 }
 
+/// Whether a tool path is inside the workspace. Relative paths are taken
+/// from the workspace root; `..` segments count as outside.
+pub fn isInsideWorkspace(workspace_root: []const u8, path: []const u8) bool {
+    var relative = path;
+    if (std.fs.path.isAbsolute(path)) {
+        const root = std.mem.trimEnd(u8, workspace_root, "/");
+        if (root.len == 0 or !std.mem.startsWith(u8, path, root) or path.len <= root.len or path[root.len] != '/') return false;
+        relative = path[root.len + 1 ..];
+    }
+    var segments = std.mem.tokenizeScalar(u8, relative, '/');
+    while (segments.next()) |segment| {
+        if (std.mem.eql(u8, segment, "..")) return false;
+    }
+    return true;
+}
+
 fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
     return std.mem.lessThan(u8, lhs, rhs);
 }
@@ -419,6 +454,18 @@ test "pick matches names and the only change in a status" {
     try std.testing.expect(pick(&two, null, .proposed) == .ambiguous);
 }
 
+test "pendingProposal prefers the proposal the conversation names" {
+    const changes = [_]Change{
+        parseChange("2026-09-27-add-payments.md", "---\nstatus: proposed\n---\n"),
+        parseChange("2026-09-27-cuotas.md", "---\nstatus: proposed\n---\n"),
+        parseChange("2026-09-28-zeta.md", "---\nstatus: done\n---\n"),
+    };
+    try std.testing.expectEqualStrings("2026-09-27-add-payments.md", pendingProposal(&changes, &.{"sí, aprueba add-payments"}).?.file);
+    try std.testing.expectEqualStrings("2026-09-27-cuotas.md", pendingProposal(&changes, &.{"sí, aprobado"}).?.file);
+    try std.testing.expectEqualStrings("2026-09-27-cuotas.md", pendingProposal(&changes, &.{ "si yes, commit the cuotas change", "ls: 2026-09-27-add-payments.md 2026-09-27-cuotas.md" }).?.file);
+    try std.testing.expect(pendingProposal(changes[2..], &.{}) == null);
+}
+
 test "slugs, templates and sdd paths" {
     try std.testing.expect(validSlug("pagos-parciales"));
     try std.testing.expect(validSlug("v2"));
@@ -439,6 +486,12 @@ test "slugs, templates and sdd paths" {
     try std.testing.expect(!isSddPath("/repo", "src/sdd/a.md"));
     try std.testing.expect(!isSddPath("/repo", "/repository/sdd/a.md"));
     try std.testing.expect(!isSddPath("/repo", "sdd/../src/a.ts"));
+
+    try std.testing.expect(isInsideWorkspace("/repo", "src/a.ts"));
+    try std.testing.expect(isInsideWorkspace("/repo/", "/repo/src/a.ts"));
+    try std.testing.expect(!isInsideWorkspace("/repo", "/tmp/pr-body.md"));
+    try std.testing.expect(!isInsideWorkspace("/repo", "/repository/a.ts"));
+    try std.testing.expect(!isInsideWorkspace("/repo", "../other/a.ts"));
 }
 
 test "newChange writes the template once and lists it" {

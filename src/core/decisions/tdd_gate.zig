@@ -208,7 +208,7 @@ fn argString(arena: Allocator, arguments_json: []const u8, field: []const u8) ?[
 
 /// Whether a pending file change is source code the gate cares about.
 pub fn isSourceChange(workspace_root: []const u8, path: []const u8) bool {
-    return !sdd_layout.isSddPath(workspace_root, path) and !isTestPath(path);
+    return sdd_layout.isInsideWorkspace(workspace_root, path) and !sdd_layout.isSddPath(workspace_root, path) and !isTestPath(path);
 }
 
 pub const meaningful_id = "tests_check_request";
