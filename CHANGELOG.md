@@ -1,8 +1,18 @@
 # fx
 
-## 0.3.2
+## 0.3.3
 
 <!-- release:start -->
+
+**Turns no longer stop when a model sends broken tool arguments.**
+
+### Bug Fixes
+
+- **Broken tool arguments:** With OpenAI-compatible providers such as DeepSeek, a tool call whose arguments are not valid JSON no longer ends the turn with `request failed: InvalidToolArguments`. fx skips that call, tells the model what was wrong so it can retry, and still runs the other calls in the same step. Saved sessions that contain such a call keep working.
+<!-- release:end -->
+
+## 0.3.2
+
 
 **Spec-driven development gets out of the way when you ship: opening a PR no longer asks for a proposal, and your "yes" always counts.**
 
@@ -16,7 +26,6 @@
 - **Approvals in any turn:** A reply such as "si yes" approves the pending proposal even when that turn only pushes or opens a PR, and a "yes" with extra instructions still counts.
 - **The right proposal:** With several proposals open, fx approves the one your reply names, or the newest.
 - **Bugs versus tweaks:** Changing how something looks or adding a filter is no longer treated as a bug, so test-first mode does not ask for a regression test.
-<!-- release:end -->
 
 ## 0.3.1
 
