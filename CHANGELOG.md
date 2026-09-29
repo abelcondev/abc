@@ -1,15 +1,24 @@
 # fx
 
-## 0.3.3
+## 0.4.0
 
 <!-- release:start -->
+
+**fx now connects to Meta's Muse models.**
+
+### New Features
+
+- **Meta Muse provider:** `fx login muse` or `MUSE_API_KEY` connects fx to the Meta Model API with `muse-spark-1.3` (also `muse-spark-1.3-contributor`), including tools, images, a 1M-token context and reasoning levels from `low` to `max`.
+<!-- release:end -->
+
+## 0.3.3
+
 
 **Turns no longer stop when a model sends broken tool arguments.**
 
 ### Bug Fixes
 
 - **Broken tool arguments:** With OpenAI-compatible providers such as DeepSeek, a tool call whose arguments are not valid JSON no longer ends the turn with `request failed: InvalidToolArguments`. fx skips that call, tells the model what was wrong so it can retry, and still runs the other calls in the same step. Saved sessions that contain such a call keep working.
-<!-- release:end -->
 
 ## 0.3.2
 

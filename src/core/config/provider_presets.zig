@@ -16,6 +16,9 @@ const ReasoningEffort = types.ReasoningEffort;
 const on_off = [_]ReasoningEffort{ ReasoningEffort.literal("none"), ReasoningEffort.literal("high") };
 const deepseek_efforts = [_]ReasoningEffort{ ReasoningEffort.literal("none"), ReasoningEffort.literal("low"), ReasoningEffort.literal("high"), ReasoningEffort.literal("max") };
 const low_medium_high = [_]ReasoningEffort{ ReasoningEffort.literal("low"), ReasoningEffort.literal("medium"), ReasoningEffort.literal("high") };
+// Muse Spark always reasons and rejects `none`; `minimal` is accepted but
+// routes to a model the API does not serve.
+const muse_efforts = [_]ReasoningEffort{ ReasoningEffort.literal("low"), ReasoningEffort.literal("medium"), ReasoningEffort.literal("high"), ReasoningEffort.literal("xhigh"), ReasoningEffort.literal("max") };
 
 fn preset(
     comptime id: []const u8,
@@ -100,6 +103,13 @@ pub const definitions = [_]Definition{
         .reasoning_format = .none,
         .default_model = "MiniMax-M2",
     }),
+    preset("muse", "https://api.meta.ai/v1", "MUSE_API_KEY", .{
+        .default_model = "muse-spark-1.3",
+        .models = &.{
+            .{ .id = "muse-spark-1.3", .context_window = 1_048_576, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &muse_efforts },
+            .{ .id = "muse-spark-1.3-contributor", .context_window = 1_048_576, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &muse_efforts },
+        },
+    }),
     preset("openrouter", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", .{
         .reasoning_format = .openrouter,
     }),
@@ -154,6 +164,8 @@ test "provider presets are valid connection definitions" {
         }
     }
     try std.testing.expectEqualStrings("DEEPSEEK_API_KEY", get("deepseek").?.auth.bearer);
+    try std.testing.expectEqualStrings("MUSE_API_KEY", get("muse").?.auth.bearer);
+    try std.testing.expectEqualStrings("muse-spark-1.3", get("muse").?.default_model.?);
     try std.testing.expect(get("ollama").?.auth == .none);
     try std.testing.expect(get("missing") == null);
 }
