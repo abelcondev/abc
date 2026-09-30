@@ -80,6 +80,12 @@ pub const Gate = struct {
     /// Jev already judged this turn whether the user's message approves the
     /// pending proposal.
     sdd_approval_checked: bool = false,
+    /// Change statuses as of the last turn end, so a status the user changed
+    /// between turns (`/sdd approve|done`) reaches the agent. Null until
+    /// the first snapshot. Owned.
+    sdd_seen: ?[]sdd_gate.SeenStatus = null,
+    /// This turn already compared the statuses against `sdd_seen`.
+    sdd_status_checked: bool = false,
     /// Decision files already flagged by the drift check. Owned keys.
     drift_reported: std.StringHashMapUnmanaged(void) = .empty,
 
@@ -106,6 +112,7 @@ pub const Gate = struct {
         if (self.lent) |text| self.alloc.free(text);
         self.clearTouched();
         self.sdd_touched.deinit(self.alloc);
+        self.clearSeen();
         var reported = self.drift_reported.keyIterator();
         while (reported.next()) |key| self.alloc.free(key.*);
         self.drift_reported.deinit(self.alloc);
@@ -144,6 +151,91 @@ pub const Gate = struct {
                 .run = stopHandler,
             });
         }
+    }
+
+    fn clearSeen(self: *Gate) void {
+        const seen = self.sdd_seen orelse return;
+        for (seen) |entry| self.alloc.free(entry.file);
+        self.alloc.free(seen);
+        self.sdd_seen = null;
+    }
+
+    /// Replaces the status snapshot with `changes`.
+    fn rememberStatuses(self: *Gate, changes: []const sdd_layout.Change) !void {
+        const seen = try self.alloc.alloc(sdd_gate.SeenStatus, changes.len);
+        var filled: usize = 0;
+        errdefer {
+            for (seen[0..filled]) |entry| self.alloc.free(entry.file);
+            self.alloc.free(seen);
+        }
+        for (changes) |change| {
+            seen[filled] = .{ .file = try self.alloc.dupe(u8, change.file), .status = change.status };
+            filled += 1;
+        }
+        self.clearSeen();
+        self.sdd_seen = seen;
+    }
+
+    /// Sets a change's status on disk and in the snapshot, so fx's own
+    /// status changes are not reported to the agent as the user's.
+    fn setChangeStatus(self: *Gate, root: std.Io.Dir, file: []const u8, status: sdd_layout.Status) !void {
+        try sdd_layout.setStatus(self.alloc, root, file, status);
+        const seen = self.sdd_seen orelse return;
+        for (seen) |*entry| {
+            if (std.mem.eql(u8, entry.file, file)) entry.status = status;
+        }
+    }
+
+    /// Status changes since the last snapshot, then a fresh snapshot. Empty
+    /// on the first call, when there is nothing to compare against.
+    fn takeStatusChanges(self: *Gate, arena: Allocator, root_path: []const u8) ![]const sdd_gate.StatusChange {
+        if (self.sdd_turn_mode == null) self.sdd_turn_mode = sdd_mode.load(self.alloc, root_path);
+        if (!self.sdd_turn_mode.?.enabled) return &.{};
+        const io = io_mod.getIo();
+        var root = try std.Io.Dir.cwd().openDir(io, root_path, .{});
+        defer root.close(io);
+        const changes = try sdd_layout.listChanges(arena, root);
+        const moved = if (self.sdd_seen) |seen| try sdd_gate.statusChanges(arena, seen, changes) else &.{};
+        try self.rememberStatuses(changes);
+        return moved;
+    }
+
+    /// Holds the first tool call of a turn once when the user changed a
+    /// change's status since the agent last looked.
+    fn checkStatusChanges(self: *Gate, input: hooks.PreToolUseInput) !?hooks.PreToolUseAction {
+        if (self.sdd_status_checked) return null;
+        self.sdd_status_checked = true;
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const moved = try self.takeStatusChanges(arena_state.allocator(), input.invocation.scope.workspace_root);
+        if (moved.len == 0) return null;
+        var entry = self.newEntry("sdd", input.invocation, 0);
+        entry.outcome = "hold";
+        entry.detail = "the user changed a change's status";
+        decision_log.append(self.alloc, entry);
+        return .{ .block = self.lend(try sdd_gate.statusChangedReason(self.alloc, moved)) };
+    }
+
+    /// At a turn end: delivers status changes no tool call carried when the
+    /// answer names one of those changes, then refreshes the snapshot.
+    fn checkStatusChangesAtStop(self: *Gate, input: hooks.StopInput) !?hooks.StopAction {
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const delivered = self.sdd_status_checked;
+        self.sdd_status_checked = true;
+        const moved = try self.takeStatusChanges(arena, input.invocation.scope.workspace_root);
+        if (delivered or moved.len == 0 or !input.can_continue) return null;
+        var named: std.ArrayList(sdd_gate.StatusChange) = .empty;
+        for (moved) |change| {
+            if (sdd_gate.mentionsChange(input.assistant_text, change.file)) try named.append(arena, change);
+        }
+        if (named.items.len == 0) return null;
+        var entry = self.newEntry("sdd", input.invocation, 0);
+        entry.outcome = "continue";
+        entry.detail = "the answer names a change whose status the user changed";
+        decision_log.append(self.alloc, entry);
+        return .{ .continue_once = self.lend(try sdd_gate.statusChangedAtStop(self.alloc, named.items)) };
     }
 
     fn clearTouched(self: *Gate) void {
@@ -188,6 +280,7 @@ pub const Gate = struct {
         self.sdd_change = null;
         self.sdd_incomplete_held = false;
         self.sdd_approval_checked = false;
+        self.sdd_status_checked = false;
     }
 
     fn newEntry(self: *const Gate, gate: []const u8, invocation: hooks.Invocation, threshold: f64) decision_log.Entry {
@@ -266,6 +359,13 @@ pub const Gate = struct {
         const action = blk: {
             if (config.ask_gate and std.mem.eql(u8, tool, ask_gate.tool_name)) break :blk self.checkAsk(input);
             if (config.routes.len != 0 and std.mem.eql(u8, tool, routing.tool_name)) break :blk self.routeSubagent(input);
+            if (config.sdd_gate) {
+                const status_action = self.checkStatusChanges(input) catch |err| status: {
+                    debug_trace.logf("jev", "sdd status check failed err={s}", .{@errorName(err)});
+                    break :status null;
+                };
+                if (status_action) |held| break :blk held;
+            }
             if (config.sdd_gate and std.mem.eql(u8, tool, "shell")) {
                 if (self.checkStatusCommand(input)) |held| break :blk held;
             }
@@ -428,7 +528,7 @@ pub const Gate = struct {
         };
         if (proposed) |change| {
             if (verdict.approves) {
-                try sdd_layout.setStatus(self.alloc, root, change.file, .approved);
+                try self.setChangeStatus(root, change.file, .approved);
                 self.sdd_settled = true;
                 self.sdd_route = .{ .route = .change, .manual = change.tdd_manual };
                 entry.outcome = "approved";
@@ -665,6 +765,11 @@ pub const Gate = struct {
             self.checkApprovalAtStop(input) catch |err| {
                 debug_trace.logf("jev", "approval check failed err={s}", .{@errorName(err)});
             };
+            const status_action = self.checkStatusChangesAtStop(input) catch |err| status: {
+                debug_trace.logf("jev", "sdd status check failed err={s}", .{@errorName(err)});
+                break :status null;
+            };
+            if (status_action) |action| return action;
         }
         if (!input.can_continue) return .allow;
         return self.checkCompletion(input) catch |err| {
@@ -766,7 +871,7 @@ pub const Gate = struct {
             decision_log.append(self.alloc, entry);
             return;
         }
-        try sdd_layout.setStatus(self.alloc, root, proposed.file, .approved);
+        try self.setChangeStatus(root, proposed.file, .approved);
         entry.outcome = "approved";
         entry.detail = proposed.file;
         decision_log.append(self.alloc, entry);

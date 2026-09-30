@@ -322,6 +322,74 @@ pub fn statusCommand(command: []const u8) ?StatusCommand {
     return null;
 }
 
+/// A change's status as fx last saw it at the end of a turn.
+pub const SeenStatus = struct {
+    file: []const u8,
+    status: ?sdd_layout.Status,
+};
+
+pub const StatusChange = struct {
+    file: []const u8,
+    from: ?sdd_layout.Status,
+    to: ?sdd_layout.Status,
+};
+
+/// Changes in `now` whose status differs from `seen`. Files that were not
+/// seen are left out: the agent writes new proposals itself.
+pub fn statusChanges(arena: Allocator, seen: []const SeenStatus, now: []const sdd_layout.Change) ![]const StatusChange {
+    var list: std.ArrayList(StatusChange) = .empty;
+    for (now) |change| {
+        for (seen) |before| {
+            if (!std.mem.eql(u8, before.file, change.file)) continue;
+            if (before.status != change.status) try list.append(arena, .{ .file = change.file, .from = before.status, .to = change.status });
+            break;
+        }
+    }
+    return list.items;
+}
+
+/// Whether `text` names `file` by its stem or its slug.
+pub fn mentionsChange(text: []const u8, file: []const u8) bool {
+    const stem = std.mem.trimEnd(u8, file, ".md");
+    const slug = if (stem.len > 11 and stem[10] == '-') stem[11..] else stem;
+    return std.mem.find(u8, text, stem) != null or std.mem.find(u8, text, slug) != null;
+}
+
+fn statusName(status: ?sdd_layout.Status) []const u8 {
+    return if (status) |value| @tagName(value) else "none";
+}
+
+fn writeStatusChanges(w: *std.Io.Writer, changes: []const StatusChange) !void {
+    try w.writeAll("SDD: the user changed a change's status since your last reply.\n");
+    for (changes) |change| {
+        try w.print("- {s}/{s}: {s} → {s}\n", .{ sdd_layout.changes_dir, change.file, statusName(change.from), statusName(change.to) });
+    }
+    try w.writeAll("The files on disk are current; anything said earlier about these statuses is out of date.");
+}
+
+/// Held once before the first tool call of a turn that follows a status
+/// change the user made (`/sdd approve|done`). Caller owns the text.
+pub fn statusChangedReason(alloc: Allocator, changes: []const StatusChange) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try writeStatusChanges(&out.writer, changes);
+    try out.writer.writeAll(" Retry your call.");
+    return out.toOwnedSlice();
+}
+
+/// Continuation when a final answer names a change whose status the user
+/// changed and no tool call carried the news. Caller owns the text.
+pub fn statusChangedAtStop(alloc: Allocator, changes: []const StatusChange) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try writeStatusChanges(&out.writer, changes);
+    try out.writer.writeAll(
+        " If your answer says otherwise, correct it in one short sentence; do not repeat the rest of your answer. " ++
+            "If it already matches, reply with nothing more than a short confirmation.",
+    );
+    return out.toOwnedSlice();
+}
+
 pub const self_approve_reason =
     "SDD: only the user approves a change. Do not run `fx sdd approve`. If the user already approved in their " ++
     "message, retry your code change: fx reads their reply and approves it. Otherwise show the proposal and ask them.";
@@ -437,6 +505,31 @@ test "statusCommand finds fx sdd approve and done" {
     try std.testing.expect(statusCommand("fx sdd new pagos") == null);
     try std.testing.expect(statusCommand("grep 'sdd approve' notes.md") == null);
     try std.testing.expect(statusCommand("echo fx sdd") == null);
+}
+
+test "statusChanges reports only seen changes whose status moved" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const seen = [_]SeenStatus{
+        .{ .file = "2026-09-30-trenes.md", .status = .approved },
+        .{ .file = "2026-09-27-brief.md", .status = .done },
+    };
+    const now = [_]sdd_layout.Change{
+        sdd_layout.parseChange("2026-09-27-brief.md", "---\nstatus: done\n---\n"),
+        sdd_layout.parseChange("2026-09-30-trenes.md", "---\nstatus: done\n---\n"),
+        sdd_layout.parseChange("2026-10-01-nuevo.md", "---\nstatus: proposed\n---\n"),
+    };
+    const changes = try statusChanges(arena.allocator(), &seen, &now);
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    try std.testing.expectEqualStrings("2026-09-30-trenes.md", changes[0].file);
+    try std.testing.expectEqual(sdd_layout.Status.approved, changes[0].from.?);
+    try std.testing.expectEqual(sdd_layout.Status.done, changes[0].to.?);
+
+    const reason = try statusChangedReason(std.testing.allocator, changes);
+    defer std.testing.allocator.free(reason);
+    try std.testing.expect(std.mem.find(u8, reason, "sdd/changes/2026-09-30-trenes.md: approved → done") != null);
+    try std.testing.expect(mentionsChange("el doc ventas-trenes sigue en approved", "2026-09-30-ventas-trenes.md"));
+    try std.testing.expect(!mentionsChange("listo", "2026-09-30-ventas-trenes.md"));
 }
 
 test "reasons name the files to write" {
