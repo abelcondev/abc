@@ -150,7 +150,7 @@ pub fn readyToClose(changes: []const sdd_layout.Change, text: []const u8) ?sdd_l
     var first: ?sdd_layout.Change = null;
     for (changes) |change| {
         if (change.status != .approved or change.tasks_total == 0 or change.tasks_done != change.tasks_total) continue;
-        if (mentionsChange(text, change.file)) return change;
+        if (sdd_layout.mentions(text, change.file)) return change;
         if (first == null) first = change;
     }
     return first;
@@ -396,13 +396,6 @@ pub fn statusChanges(arena: Allocator, seen: []const SeenStatus, now: []const sd
     return list.items;
 }
 
-/// Whether `text` names `file` by its stem or its slug.
-pub fn mentionsChange(text: []const u8, file: []const u8) bool {
-    const stem = std.mem.trimEnd(u8, file, ".md");
-    const slug = if (stem.len > 11 and stem[10] == '-') stem[11..] else stem;
-    return std.mem.find(u8, text, stem) != null or std.mem.find(u8, text, slug) != null;
-}
-
 fn statusName(status: ?sdd_layout.Status) []const u8 {
     return if (status) |value| @tagName(value) else "none";
 }
@@ -601,8 +594,8 @@ test "statusChanges reports only seen changes whose status moved" {
     const reason = try statusChangedReason(std.testing.allocator, changes);
     defer std.testing.allocator.free(reason);
     try std.testing.expect(std.mem.find(u8, reason, "sdd/changes/2026-09-30-trenes.md: approved → done") != null);
-    try std.testing.expect(mentionsChange("el doc ventas-trenes sigue en approved", "2026-09-30-ventas-trenes.md"));
-    try std.testing.expect(!mentionsChange("listo", "2026-09-30-ventas-trenes.md"));
+    try std.testing.expect(sdd_layout.mentions("el doc ventas-trenes sigue en approved", "2026-09-30-ventas-trenes.md"));
+    try std.testing.expect(!sdd_layout.mentions("listo", "2026-09-30-ventas-trenes.md"));
 }
 
 test "reasons name the files to write" {

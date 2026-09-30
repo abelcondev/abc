@@ -222,19 +222,34 @@ pub fn firstWithStatus(changes: []const Change, status: Status) ?Change {
 /// (highest priority first) that names a proposed change's file or slug
 /// picks it; otherwise the newest proposed change.
 pub fn pendingProposal(changes: []const Change, context: []const []const u8) ?Change {
-    for (context) |text| {
-        for (changes) |change| {
-            if (change.status != .proposed) continue;
-            const stem = std.mem.trimEnd(u8, change.file, ".md");
-            const slug = if (stem.len > 11 and stem[10] == '-') stem[11..] else stem;
-            if (std.mem.find(u8, text, stem) != null or std.mem.find(u8, text, slug) != null) return change;
-        }
-    }
+    if (named(changes, .proposed, context)) |change| return change;
     var newest: ?Change = null;
     for (changes) |change| {
         if (change.status == .proposed) newest = change;
     }
     return newest;
+}
+
+/// The approved change a turn is about: the first text in `context` that
+/// names one picks it; otherwise the first approved change.
+pub fn activeChange(changes: []const Change, context: []const []const u8) ?Change {
+    return named(changes, .approved, context) orelse firstWithStatus(changes, .approved);
+}
+
+fn named(changes: []const Change, status: Status, context: []const []const u8) ?Change {
+    for (context) |text| {
+        for (changes) |change| {
+            if (change.status == status and mentions(text, change.file)) return change;
+        }
+    }
+    return null;
+}
+
+/// Whether `text` names the change `file` by its stem or its slug.
+pub fn mentions(text: []const u8, file: []const u8) bool {
+    const stem = std.mem.trimEnd(u8, file, ".md");
+    const slug = if (stem.len > 11 and stem[10] == '-') stem[11..] else stem;
+    return std.mem.find(u8, text, stem) != null or std.mem.find(u8, text, slug) != null;
 }
 
 /// Returns `text` with its front matter `status` set to `status`, adding a
@@ -452,6 +467,17 @@ test "pick matches names and the only change in a status" {
     try std.testing.expect(pick(&changes, "missing", .approved) == .not_found);
     const two = [_]Change{ changes[1], changes[1] };
     try std.testing.expect(pick(&two, null, .proposed) == .ambiguous);
+}
+
+test "activeChange prefers the approved change the turn names" {
+    const changes = [_]Change{
+        parseChange("2026-09-28-pagos-step.md", "---\nstatus: approved\n---\n"),
+        parseChange("2026-09-29-trenes-step.md", "---\nstatus: approved\n---\n"),
+        parseChange("2026-09-30-otro.md", "---\nstatus: proposed\n---\n"),
+    };
+    try std.testing.expectEqualStrings("2026-09-29-trenes-step.md", activeChange(&changes, &.{ "implementá", "{\"path\":\"sdd/changes/2026-09-29-trenes-step.md\"}" }).?.file);
+    try std.testing.expectEqualStrings("2026-09-28-pagos-step.md", activeChange(&changes, &.{"implementá"}).?.file);
+    try std.testing.expect(activeChange(changes[2..], &.{"otro"}) == null);
 }
 
 test "pendingProposal prefers the proposal the conversation names" {

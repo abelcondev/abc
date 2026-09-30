@@ -271,7 +271,7 @@ pub const Gate = struct {
         if (start.closed) |file| return .{ .continue_once = self.lend(try sdd_gate.closedAtStop(self.alloc, file)) };
         var named: std.ArrayList(sdd_gate.StatusChange) = .empty;
         for (start.moved) |change| {
-            if (sdd_gate.mentionsChange(input.assistant_text, change.file)) try named.append(arena, change);
+            if (sdd_layout.mentions(input.assistant_text, change.file)) try named.append(arena, change);
         }
         if (named.items.len == 0) return null;
         var entry = self.newEntry("sdd", input.invocation, 0);
@@ -544,7 +544,7 @@ pub const Gate = struct {
         defer root.close(io);
         const changes = try sdd_layout.listChanges(arena, root);
         var entry = self.newEntry("sdd", input.invocation, sdd_gate.rule_threshold);
-        if (sdd_layout.firstWithStatus(changes, .approved)) |approved| {
+        if (sdd_layout.activeChange(changes, try turnContext(arena, input.user_request, input.assistant_text, input.turn_messages))) |approved| {
             self.sdd_settled = true;
             self.sdd_route = .{ .route = .change, .manual = approved.tdd_manual };
             entry.outcome = "change";
@@ -971,7 +971,8 @@ pub const Gate = struct {
         const io = io_mod.getIo();
         var root = try std.Io.Dir.cwd().openDir(io, root_path, .{});
         defer root.close(io);
-        const change = sdd_layout.firstWithStatus(try sdd_layout.listChanges(arena, root), .approved) orelse return null;
+        const context = try turnContext(arena, input.user_request, input.assistant_text, input.turn_messages);
+        const change = sdd_layout.activeChange(try sdd_layout.listChanges(arena, root), context) orelse return null;
         const key = try std.fmt.allocPrint(arena, "specs\x00{s}", .{change.file});
         if (self.drift_reported.contains(key)) return null;
         const owned = try self.alloc.dupe(u8, key);
