@@ -301,11 +301,19 @@ pub fn changeReason(alloc: Allocator, verdict: Verdict, date: []const u8) ![]u8 
             "## Wireframe\n<only for a new screen: a black-and-white ASCII layout>\n\n## Tasks\n- [ ] <step>\n\n## Notes\n\n" ++
             "Then show it to the user and ask them to approve it. Do not change its `status` yourself (fx does) and do not " ++
             "change other files until it is approved; the user approves by replying yes or with /sdd approve. You tick " ++
-            "the Tasks checkboxes as you finish them.",
+            "the Tasks checkboxes as you finish them. " ++ finish_steps,
         .{date},
     );
     return out.toOwnedSlice();
 }
+
+/// What to do once every task is done, so the specs and the review request
+/// are part of the one final answer.
+const finish_steps =
+    "When every task is done and checked, before your final answer, write the behavior the change added or changed " ++
+    "as rules in " ++ sdd_layout.specs_dir ++ "/<area>.md (one `## ` heading per rule, the current behavior under it, " ++
+    "no history). Then give one final answer that says what changed, which rules you wrote and what you could not " ++
+    "verify, and asks the user to review it and confirm it is ok to close.";
 
 /// Why a file change was held while a proposal waits. Caller owns the text.
 pub fn pendingReason(alloc: Allocator, proposal_file: []const u8) ![]u8 {
@@ -324,7 +332,7 @@ pub fn approvedNotice(alloc: Allocator, proposal_file: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         alloc,
         "SDD: the user's reply approved {s}/{s}; fx set its status to approved. Retry this change and implement it, " ++
-            "ticking each task in its Tasks list (`- [x]`) as you finish it.",
+            "ticking each task in its Tasks list (`- [x]`) as you finish it. " ++ finish_steps,
         .{ sdd_layout.changes_dir, proposal_file },
     );
 }
@@ -462,12 +470,13 @@ pub const self_done_reason =
 pub fn specsReminder(alloc: Allocator, change_file: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         alloc,
-        "SDD: this turn changed code for {s}/{s}. Tick each finished task in its Tasks list (`- [x]`; the checkboxes " ++
-            "are yours, only `status` belongs to fx). If the change is now complete, write the behavior it added or " ++
-            "changed as rules in {s}/<area>.md (create the file if needed): one `## ` heading per rule, a short " ++
-            "description of the current behavior under it, no history; then ask the user to review the work and confirm " ++
-            "it is ok to close (their reply closes it, or /sdd done). If work remains, say what is left. Then give your " ++
-            "final answer.",
+        "SDD: recording {s}/{s} in the specs.\n" ++
+            "The user already sees your previous answer; do not repeat or summarize it. Tick each finished task in its " ++
+            "Tasks list (`- [x]`; the checkboxes are yours, only `status` belongs to fx). If the change is now complete, " ++
+            "write the behavior it added or changed as rules in {s}/<area>.md (create the file if needed): one `## ` " ++
+            "heading per rule, a short description of the current behavior under it, no history. Then reply with only " ++
+            "the rules you wrote and a request to review the work and confirm it is ok to close (their reply closes it, " ++
+            "or /sdd done). If work remains, say only what is left.",
         .{ sdd_layout.changes_dir, change_file, sdd_layout.specs_dir },
     );
 }
@@ -606,6 +615,11 @@ test "reasons name the files to write" {
     defer alloc.free(reminder);
     try std.testing.expect(std.mem.find(u8, reminder, "sdd/changes/2026-09-27-brief.md") != null);
     try std.testing.expect(std.mem.find(u8, reminder, "confirm it is ok to close") != null);
+    try std.testing.expect(std.mem.find(u8, reminder, "do not repeat or summarize it") != null);
+    const approved = try approvedNotice(alloc, "2026-09-27-brief.md");
+    defer alloc.free(approved);
+    try std.testing.expect(std.mem.find(u8, approved, "before your final answer, write the behavior") != null);
+    try std.testing.expect(std.mem.find(u8, change, "before your final answer, write the behavior") != null);
 }
 
 test "readyToClose wants an approved change with every task ticked" {
