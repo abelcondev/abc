@@ -84,8 +84,9 @@ pub const Gate = struct {
     /// between turns (`/sdd approve|done`) reaches the agent. Null until
     /// the first snapshot. Owned.
     sdd_seen: ?[]sdd_gate.SeenStatus = null,
-    /// This turn already compared the statuses against `sdd_seen`.
-    sdd_status_checked: bool = false,
+    /// This turn already compared the statuses against `sdd_seen` and
+    /// checked whether the user's message closes a finished change.
+    sdd_turn_started: bool = false,
     /// Decision files already flagged by the drift check. Owned keys.
     drift_reported: std.StringHashMapUnmanaged(void) = .empty,
 
@@ -186,48 +187,84 @@ pub const Gate = struct {
         }
     }
 
-    /// Status changes since the last snapshot, then a fresh snapshot. Empty
-    /// on the first call, when there is nothing to compare against.
-    fn takeStatusChanges(self: *Gate, arena: Allocator, root_path: []const u8) ![]const sdd_gate.StatusChange {
+    const TurnStart = struct {
+        /// Statuses the user changed since the last snapshot.
+        moved: []const sdd_gate.StatusChange = &.{},
+        /// The finished change the user's reply closed.
+        closed: ?[]const u8 = null,
+    };
+
+    /// Runs once per turn at its first hook call, before the agent has
+    /// changed anything: reports statuses the user changed since the last
+    /// snapshot, then closes a finished change when the user's message
+    /// confirms it. Results borrow from `arena`.
+    fn startSddTurn(self: *Gate, arena: Allocator, invocation: hooks.Invocation, user_request: []const u8) !TurnStart {
+        if (self.sdd_turn_started) return .{};
+        self.sdd_turn_started = true;
+        const root_path = invocation.scope.workspace_root;
         if (self.sdd_turn_mode == null) self.sdd_turn_mode = sdd_mode.load(self.alloc, root_path);
-        if (!self.sdd_turn_mode.?.enabled) return &.{};
+        if (!self.sdd_turn_mode.?.enabled) return .{};
         const io = io_mod.getIo();
         var root = try std.Io.Dir.cwd().openDir(io, root_path, .{});
         defer root.close(io);
         const changes = try sdd_layout.listChanges(arena, root);
-        const moved = if (self.sdd_seen) |seen| try sdd_gate.statusChanges(arena, seen, changes) else &.{};
+        var start = TurnStart{};
+        if (self.sdd_seen) |seen| start.moved = try sdd_gate.statusChanges(arena, seen, changes);
         try self.rememberStatuses(changes);
-        return moved;
+
+        const ready = sdd_gate.readyToClose(changes, user_request) orelse return start;
+        var entry = self.newEntry("sdd", invocation, sdd_gate.close_threshold);
+        const state = try sdd_gate.closeState(self.alloc, user_request, ready.body);
+        defer self.alloc.free(state);
+        var response = self.consult(&entry, state, &sdd_gate.close_questions) orelse return start;
+        defer response.deinit();
+        const p = response.noul(sdd_gate.closes_id) orelse {
+            self.logIncomplete(&entry, error.IncompleteJevAnswer);
+            return start;
+        };
+        if (p < sdd_gate.close_threshold) {
+            entry.outcome = "skip";
+            entry.detail = "reply does not close the change";
+            decision_log.append(self.alloc, entry);
+            return start;
+        }
+        try self.setChangeStatus(root, ready.file, .done);
+        entry.outcome = "closed";
+        entry.detail = ready.file;
+        decision_log.append(self.alloc, entry);
+        start.closed = try arena.dupe(u8, ready.file);
+        return start;
     }
 
     /// Holds the first tool call of a turn once when the user changed a
-    /// change's status since the agent last looked.
-    fn checkStatusChanges(self: *Gate, input: hooks.PreToolUseInput) !?hooks.PreToolUseAction {
-        if (self.sdd_status_checked) return null;
-        self.sdd_status_checked = true;
+    /// change's status since the agent last looked or their reply closed a
+    /// finished change.
+    fn checkSddTurnStart(self: *Gate, input: hooks.PreToolUseInput) !?hooks.PreToolUseAction {
+        if (self.sdd_turn_started) return null;
         var arena_state = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_state.deinit();
-        const moved = try self.takeStatusChanges(arena_state.allocator(), input.invocation.scope.workspace_root);
-        if (moved.len == 0) return null;
+        const start = try self.startSddTurn(arena_state.allocator(), input.invocation, input.user_request);
+        if (start.closed) |file| return .{ .block = self.lend(try sdd_gate.closedNotice(self.alloc, file)) };
+        if (start.moved.len == 0) return null;
         var entry = self.newEntry("sdd", input.invocation, 0);
         entry.outcome = "hold";
         entry.detail = "the user changed a change's status";
         decision_log.append(self.alloc, entry);
-        return .{ .block = self.lend(try sdd_gate.statusChangedReason(self.alloc, moved)) };
+        return .{ .block = self.lend(try sdd_gate.statusChangedReason(self.alloc, start.moved)) };
     }
 
-    /// At a turn end: delivers status changes no tool call carried when the
-    /// answer names one of those changes, then refreshes the snapshot.
-    fn checkStatusChangesAtStop(self: *Gate, input: hooks.StopInput) !?hooks.StopAction {
+    /// At a turn end: in a turn without tool calls, delivers a close or a
+    /// status change the answer names; always refreshes the snapshot.
+    fn checkSddAtStop(self: *Gate, input: hooks.StopInput) !?hooks.StopAction {
         var arena_state = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        const delivered = self.sdd_status_checked;
-        self.sdd_status_checked = true;
-        const moved = try self.takeStatusChanges(arena, input.invocation.scope.workspace_root);
-        if (delivered or moved.len == 0 or !input.can_continue) return null;
+        const start = try self.startSddTurn(arena, input.invocation, input.user_request);
+        defer self.refreshStatuses(arena, input.invocation.scope.workspace_root);
+        if (!input.can_continue) return null;
+        if (start.closed) |file| return .{ .continue_once = self.lend(try sdd_gate.closedAtStop(self.alloc, file)) };
         var named: std.ArrayList(sdd_gate.StatusChange) = .empty;
-        for (moved) |change| {
+        for (start.moved) |change| {
             if (sdd_gate.mentionsChange(input.assistant_text, change.file)) try named.append(arena, change);
         }
         if (named.items.len == 0) return null;
@@ -236,6 +273,19 @@ pub const Gate = struct {
         entry.detail = "the answer names a change whose status the user changed";
         decision_log.append(self.alloc, entry);
         return .{ .continue_once = self.lend(try sdd_gate.statusChangedAtStop(self.alloc, named.items)) };
+    }
+
+    /// Snapshots the statuses the turn ends with.
+    fn refreshStatuses(self: *Gate, arena: Allocator, root_path: []const u8) void {
+        const mode = self.sdd_turn_mode orelse return;
+        if (!mode.enabled) return;
+        const io = io_mod.getIo();
+        var root = std.Io.Dir.cwd().openDir(io, root_path, .{}) catch return;
+        defer root.close(io);
+        const changes = sdd_layout.listChanges(arena, root) catch return;
+        self.rememberStatuses(changes) catch |err| {
+            debug_trace.logf("jev", "sdd status snapshot failed err={s}", .{@errorName(err)});
+        };
     }
 
     fn clearTouched(self: *Gate) void {
@@ -280,7 +330,7 @@ pub const Gate = struct {
         self.sdd_change = null;
         self.sdd_incomplete_held = false;
         self.sdd_approval_checked = false;
-        self.sdd_status_checked = false;
+        self.sdd_turn_started = false;
     }
 
     fn newEntry(self: *const Gate, gate: []const u8, invocation: hooks.Invocation, threshold: f64) decision_log.Entry {
@@ -360,8 +410,9 @@ pub const Gate = struct {
             if (config.ask_gate and std.mem.eql(u8, tool, ask_gate.tool_name)) break :blk self.checkAsk(input);
             if (config.routes.len != 0 and std.mem.eql(u8, tool, routing.tool_name)) break :blk self.routeSubagent(input);
             if (config.sdd_gate) {
-                const status_action = self.checkStatusChanges(input) catch |err| status: {
-                    debug_trace.logf("jev", "sdd status check failed err={s}", .{@errorName(err)});
+                const status_action = self.checkSddTurnStart(input) catch |err| status: {
+                    self.sdd_turn_started = true;
+                    debug_trace.logf("jev", "sdd turn start failed err={s}", .{@errorName(err)});
                     break :status null;
                 };
                 if (status_action) |held| break :blk held;
@@ -762,14 +813,15 @@ pub const Gate = struct {
         defer self.mutex.unlock(io);
         if (input.invocation.turn_id) |turn| self.resetForTurn(turn);
         if (self.config.sdd_gate) {
-            self.checkApprovalAtStop(input) catch |err| {
-                debug_trace.logf("jev", "approval check failed err={s}", .{@errorName(err)});
-            };
-            const status_action = self.checkStatusChangesAtStop(input) catch |err| status: {
-                debug_trace.logf("jev", "sdd status check failed err={s}", .{@errorName(err)});
+            const status_action = self.checkSddAtStop(input) catch |err| status: {
+                self.sdd_turn_started = true;
+                debug_trace.logf("jev", "sdd turn end failed err={s}", .{@errorName(err)});
                 break :status null;
             };
             if (status_action) |action| return action;
+            self.checkApprovalAtStop(input) catch |err| {
+                debug_trace.logf("jev", "approval check failed err={s}", .{@errorName(err)});
+            };
         }
         if (!input.can_continue) return .allow;
         return self.checkCompletion(input) catch |err| {

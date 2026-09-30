@@ -342,9 +342,11 @@ Antes del primer cambio de archivos, Jev pone el pedido en una de tres rutas:
   la propuesta            y escribe las reglas nuevas en sdd/specs
 ```
 
-Aprueba respondiendo "sí" / "sí, dale", o con `/sdd approve`. Cierra con
-`/sdd done`. Solo tú apruebas y cierras: si el agente corre esos comandos por su
-cuenta, fx los frena.
+Aprueba respondiendo "sí" / "sí, dale", o con `/sdd approve`. Cuando todas las
+tareas están marcadas, el agente te muestra lo que hizo y te pide que lo revises;
+cierra respondiendo "ok" / "perfecto, cerralo", o con `/sdd done`. Solo tú
+apruebas y cierras: si el agente corre esos comandos por su cuenta, fx los frena.
+Si cambias un estado con `/sdd`, fx se lo avisa al agente en su siguiente turno.
 
 ```bash
 fx sdd new <slug>          # crea un archivo de cambio a mano
