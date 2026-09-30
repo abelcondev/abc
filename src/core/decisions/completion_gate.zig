@@ -42,7 +42,7 @@ pub const questions = [_]jev_contract.Question{
         .instructions = "What `user_request` asks the coding agent to do",
         .kind = .{ .choice = &.{
             .{ .name = "work", .description = "change files, run commands, fix, build, test, or produce an artifact" },
-            .{ .name = "information", .description = "only explain, answer a question, review, or give an opinion without changing anything" },
+            .{ .name = "information", .description = "only explain, answer a question, review, or give an opinion without changing anything, or tell the agent that something already happened (for example that a pull request was merged) so it only needs to acknowledge it" },
             .{ .name = "conversation", .description = "greeting, thanks, or small talk" },
         } },
     },
@@ -53,7 +53,7 @@ pub const questions = [_]jev_contract.Question{
     },
     .{
         .id = claims_supported_id,
-        .instructions = "Every statement in `final_message` about work that was done or checks that passed is backed by a matching tool result in `evidence`",
+        .instructions = "Every statement in `final_message` about work done or checks passed in this turn is backed by a matching tool result in `evidence`. Statements that `final_message` presents as coming from earlier turns (for example done before, verified earlier, ya aplicado antes) are background and need no evidence here; a statement about the current state of a file, branch or pull request still does",
         .kind = .noul,
     },
     // Two atomic questions: a single "blocked or asks the user" question
@@ -131,7 +131,7 @@ pub fn feedback(alloc: Allocator, verdict: @FieldType(Verdict, "failed")) ![]u8 
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const w = &out.writer;
-    try w.writeAll("Jev, an independent completion check, could not confirm that this turn is finished:\n");
+    try w.writeAll("Jev: this turn's tool results do not back the answer yet.\n");
     if (verdict.failures.contains(.work_not_done)) {
         try w.print("- The tool results do not show that the requested work was carried out (p={d:.2}).\n", .{verdict.work_done});
     }
@@ -139,9 +139,10 @@ pub fn feedback(alloc: Allocator, verdict: @FieldType(Verdict, "failed")) ![]u8 
         try w.print("- Some claims in the final answer are not backed by tool results (p={d:.2}).\n", .{verdict.claims_supported});
     }
     try w.writeAll(
-        "Before finishing, verify the work with tools (run the relevant tests or build, or read back the changed files), " ++
-            "complete anything that is missing, and then give a final answer that only claims what the evidence shows. " ++
-            "If something cannot be done, say so plainly instead of claiming it.",
+        "The user already sees your previous answer. Check with tools only what is missing or unsupported (run the " ++
+            "relevant tests or build, or read back the changed files), and complete any requested work that is not done. " ++
+            "Then reply with only the correction: what you checked or finished now, and any claim you take back. Do not " ++
+            "repeat or summarize the rest of your previous answer. If something cannot be done, say so plainly.",
     );
     return out.toOwnedSlice();
 }
@@ -267,6 +268,8 @@ test "evaluate passes supported work and fails unsupported claims" {
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.find(u8, text, "not backed by tool results (p=0.20)") != null);
     try std.testing.expect(std.mem.find(u8, text, "requested work was carried out") == null);
+    try std.testing.expect(std.mem.startsWith(u8, text, "Jev: this turn's tool results do not back the answer yet.\n"));
+    try std.testing.expect(std.mem.find(u8, text, "Do not repeat or summarize") != null);
 }
 
 test "evaluate skips non-work requests and honest blockers" {

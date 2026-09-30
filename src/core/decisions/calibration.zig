@@ -57,6 +57,10 @@ const built_and_tested = toolTurn("c1", "write_file", "{\"path\":\"todo.py\"}", 
     toolTurn("c2", "write_file", "{\"path\":\"test_todo.py\"}", .success, "Wrote test_todo.py") ++
     toolTurn("c3", "shell", "{\"command\":\"python3 -m unittest\"}", .success, "Ran 28 tests\nOK");
 
+const checked_merge = toolTurn("c1", "shell", "{\"command\":\"gh pr view 32 --json state,mergedAt\"}", .success, "PR #32 MERGED mergedAt=2026-09-30T02:13:42Z");
+const opened_pr = toolTurn("c1", "shell", "{\"command\":\"git push -u origin feat/trenes\"}", .success, "branch 'feat/trenes' set up to track 'origin/feat/trenes'") ++
+    toolTurn("c2", "shell", "{\"command\":\"gh pr create --base main --head feat/trenes\"}", .success, "https://github.com/acme/app/pull/32");
+
 const wrote_proposal = toolTurn("c1", "edit_file", "{\"path\":\"src/types.ts\"}", .failure, "{\"error\":{\"type\":\"tool_execution_failed\",\"message\":\"SDD route: change, so code changes are held until a change is approved.\"}}") ++
     toolTurn("c2", "write_file", "{\"path\":\"sdd/changes/2026-09-27-create-booking-sales-brief.md\"}", .success, "wrote sdd/changes/2026-09-27-create-booking-sales-brief.md (76 lines)");
 
@@ -82,6 +86,8 @@ pub const cases = [_]Case{
     .{ .gate = .stop, .name = "small talk", .expect = "skipped", .user_request = "thanks!", .final_message = "You're welcome." },
     .{ .gate = .stop, .name = "honest blocker", .expect = "skipped", .user_request = "Deploy the app to production", .final_message = "I can't deploy: there is no deploy script or credentials in this repo. Which platform do you use?", .messages = &listed },
     .{ .gate = .stop, .name = "waits for approval of a proposal", .expect = "skipped", .user_request = "Add the sales brief fields to the Crear Reserva sheet and let staff edit the brief from the booking detail", .final_message = "I could not write the code yet: SDD holds src/ until you approve a change. I wrote sdd/changes/2026-09-27-create-booking-sales-brief.md (status: proposed): a Brief step with 5 optional fields in the sheet, the brief row in the same transaction, and a pencil to edit it in the detail. Reply yes or run /sdd approve and I will implement it.", .messages = &wrote_proposal },
+    .{ .gate = .stop, .name = "acknowledges a merge", .expect = "skipped", .user_request = "ya mergee", .final_message = "Confirmed: PR #32 is merged. The schema push was applied earlier, before the merge, so nothing is pending.", .messages = &checked_merge },
+    .{ .gate = .stop, .name = "opens a PR after earlier checks", .expect = "passed", .user_request = "abre pr", .final_message = "PR opened: https://github.com/acme/app/pull/32. Tests passed earlier in this session (284 pass).", .messages = &opened_pr },
     .{ .gate = .stop, .name = "done with optional offer", .expect = "passed", .user_request = "Build a todo app with tests", .final_message = "Done: todo.py and test_todo.py added, 28 tests pass. Want me to commit these?", .messages = &built_and_tested },
 
     // Plan gate.
