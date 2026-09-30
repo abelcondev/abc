@@ -332,7 +332,8 @@ pub fn feedback(alloc: Allocator, dir: []const u8, stale: []const Finding) ![]u8
         try w.writeAll(
             "Read each rule. If the change is intended, rewrite the rule under its `## ` heading so it describes the " ++
                 "behavior as it is now (a spec holds only current behavior, not history). If the change was a mistake, " ++
-                "fix the code instead. Then give your final answer, mentioning which rules you updated.",
+                "fix the code instead. The user already sees your previous answer; then reply with only which rules you " ++
+                "updated or what you fixed, without repeating it.",
         );
         return out.toOwnedSlice();
     }
@@ -341,7 +342,8 @@ pub fn feedback(alloc: Allocator, dir: []const u8, stale: []const Finding) ![]u8
     try w.writeAll(
         "Read each record. If the change is intended, update the record so it describes the code as it is now " ++
             "(keep its format and add a short note of what changed). If the change was a mistake, fix the code instead. " ++
-            "Then give your final answer, mentioning which records you updated.",
+            "The user already sees your previous answer; then reply with only which records you updated or what you " ++
+            "fixed, without repeating it.",
     );
     return out.toOwnedSlice();
 }
