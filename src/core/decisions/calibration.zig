@@ -21,7 +21,7 @@ const sdd_layout = @import("../sdd/sdd_layout.zig");
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
 
-pub const Gate = enum { stop, plan, action, ask, routing, sdd };
+pub const Gate = enum { stop, plan, action, ask, routing, sdd, close };
 
 const Case = struct {
     gate: Gate,
@@ -36,7 +36,7 @@ const Case = struct {
     arguments: []const u8 = "{}",
     /// SDD rules the request is checked against.
     rules: []const sdd_layout.Rule = &.{},
-    /// SDD change waiting for approval.
+    /// SDD change waiting for approval, or the finished change to close.
     proposal: ?[]const u8 = null,
 };
 
@@ -74,6 +74,8 @@ const reservas_rules = [_]sdd_layout.Rule{
     .{ .capability = "chat", .title = "Dictation never sends by itself", .body = "Dictated text lands in the composer; only the user sends it." },
     .{ .capability = "ministerio", .title = "Boletos from a PDF are read-only", .body = "A boleto linked to a PDF attachment shows Ver PDF and cannot be edited; manual boletos stay editable." },
 };
+const trenes_done = "# Trenes step\n\n## What\n- A Trenes step in the booking wizard with Tramo, Ida, Retorno and Comentarios\n\n## Tasks\n- [x] Schema\n- [x] Wizard step\n- [x] Specs";
+const review_request = "Implemented and verified: bun test 284 pass, build OK. I wrote sdd/specs/trenes.md. Not verified: the wizard in a browser. Please review it and confirm it is ok to close.";
 const pagos_proposal = "# Pagos parciales\n\n## Why\nAgencies collect in installments.\n\n## What\n- New payment_plans table with installments per booking\n- A Plan de pagos panel in the booking detail\n\n## Tasks\n- [ ] Schema\n- [ ] Panel";
 
 pub const cases = [_]Case{
@@ -139,6 +141,14 @@ pub const cases = [_]Case{
     .{ .gate = .sdd, .name = "yes with an extra instruction", .expect = "approved", .user_request = "si yes, y haz commit del archivo del change", .tool = "edit_file", .arguments = "{\"path\":\"src/cuotas.js\"}", .rules = &reservas_rules, .proposal = pagos_proposal },
     .{ .gate = .sdd, .name = "yes then open the PR", .expect = "approved", .user_request = "si yes", .assistant_text = "The proposal is written; approve it and I will push the branch and open the PR.", .tool = "write_file", .arguments = "{\"path\":\"src/payment_plans.ts\"}", .rules = &reservas_rules, .proposal = pagos_proposal },
     .{ .gate = .sdd, .name = "user asks to change proposal", .expect = "change", .user_request = "No, instead of a new table store the installments as a JSON field on bookings", .tool = "write_file", .arguments = "{\"path\":\"db/payment_plans.ts\"}", .rules = &reservas_rules, .proposal = pagos_proposal },
+
+    // Closing a finished SDD change.
+    .{ .gate = .close, .name = "ok done", .expect = "closed", .user_request = "ok perfecto done", .assistant_text = review_request, .proposal = trenes_done },
+    .{ .gate = .close, .name = "ok with an extra instruction", .expect = "closed", .user_request = "ok perfecto, revisé el cambio de trenes y está todo bien. Mostrame el git status.", .assistant_text = review_request, .proposal = trenes_done },
+    .{ .gate = .close, .name = "fine, open the PR", .expect = "closed", .user_request = "está bien, abrí la PR", .assistant_text = review_request, .proposal = trenes_done },
+    .{ .gate = .close, .name = "asks for a fix", .expect = "open", .user_request = "falta que el tramo sea obligatorio, arreglalo", .assistant_text = review_request, .proposal = trenes_done },
+    .{ .gate = .close, .name = "only asks a question", .expect = "open", .user_request = "¿qué archivos cambiaste?", .assistant_text = review_request, .proposal = trenes_done },
+    .{ .gate = .close, .name = "other work", .expect = "open", .user_request = "ahora agregá un filtro por fecha en la lista de reservas", .assistant_text = review_request, .proposal = trenes_done },
 };
 
 pub const Result = struct {
@@ -188,6 +198,10 @@ pub fn run(arena: Allocator, config: jev_config.Config, api_key: []const u8, cas
             questions = try sdd_gate.questions(arena, case.rules.len, case.proposal != null);
             state = try sdd_gate.buildState(arena, sddInput(case));
         },
+        .close => {
+            questions = &sdd_gate.close_questions;
+            state = try sdd_gate.closeState(arena, case.user_request, case.proposal orelse "", case.assistant_text);
+        },
     }
 
     var response = typesafe.systemOne(arena, .{
@@ -209,6 +223,7 @@ pub fn run(arena: Allocator, config: jev_config.Config, api_key: []const u8, cas
             (if (v.approves) "approved" else if (v.bug and v.route == .fix) "fix+bug" else @tagName(v.route))
         else |err|
             @errorName(err),
+        .close => if (response.noul(sdd_gate.closes_id)) |p| (if (p >= sdd_gate.close_threshold) "closed" else "open") else "IncompleteJevAnswer",
     };
     return .{
         .gate = case.gate,

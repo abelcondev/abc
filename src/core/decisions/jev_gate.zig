@@ -42,6 +42,7 @@ const sdd_mode = @import("../sdd/sdd_mode.zig");
 const sdd_layout = @import("../sdd/sdd_layout.zig");
 const sdd_gate = @import("sdd_gate.zig");
 const tdd_gate = @import("tdd_gate.zig");
+const turn_text = @import("turn_text.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -84,6 +85,9 @@ pub const Gate = struct {
     /// between turns (`/sdd approve|done`) reaches the agent. Null until
     /// the first snapshot. Owned.
     sdd_seen: ?[]sdd_gate.SeenStatus = null,
+    /// The agent's final answer from the last turn end, so Jev can read the
+    /// user's reply to a review request. Owned.
+    last_answer: ?[]u8 = null,
     /// This turn already compared the statuses against `sdd_seen` and
     /// checked whether the user's message closes a finished change.
     sdd_turn_started: bool = false,
@@ -114,6 +118,7 @@ pub const Gate = struct {
         self.clearTouched();
         self.sdd_touched.deinit(self.alloc);
         self.clearSeen();
+        if (self.last_answer) |text| self.alloc.free(text);
         var reported = self.drift_reported.keyIterator();
         while (reported.next()) |key| self.alloc.free(key.*);
         self.drift_reported.deinit(self.alloc);
@@ -214,7 +219,7 @@ pub const Gate = struct {
 
         const ready = sdd_gate.readyToClose(changes, user_request) orelse return start;
         var entry = self.newEntry("sdd", invocation, sdd_gate.close_threshold);
-        const state = try sdd_gate.closeState(self.alloc, user_request, ready.body);
+        const state = try sdd_gate.closeState(self.alloc, user_request, ready.body, self.last_answer orelse "");
         defer self.alloc.free(state);
         var response = self.consult(&entry, state, &sdd_gate.close_questions) orelse return start;
         defer response.deinit();
@@ -261,6 +266,7 @@ pub const Gate = struct {
         const arena = arena_state.allocator();
         const start = try self.startSddTurn(arena, input.invocation, input.user_request);
         defer self.refreshStatuses(arena, input.invocation.scope.workspace_root);
+        defer self.rememberAnswer(input.assistant_text);
         if (!input.can_continue) return null;
         if (start.closed) |file| return .{ .continue_once = self.lend(try sdd_gate.closedAtStop(self.alloc, file)) };
         var named: std.ArrayList(sdd_gate.StatusChange) = .empty;
@@ -273,6 +279,12 @@ pub const Gate = struct {
         entry.detail = "the answer names a change whose status the user changed";
         decision_log.append(self.alloc, entry);
         return .{ .continue_once = self.lend(try sdd_gate.statusChangedAtStop(self.alloc, named.items)) };
+    }
+
+    fn rememberAnswer(self: *Gate, text: []const u8) void {
+        const kept = self.alloc.dupe(u8, turn_text.clipTail(text, sdd_gate.Limits.last_reply_bytes)) catch return;
+        if (self.last_answer) |old| self.alloc.free(old);
+        self.last_answer = kept;
     }
 
     /// Snapshots the statuses the turn ends with.

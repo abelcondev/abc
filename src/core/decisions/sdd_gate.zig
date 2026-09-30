@@ -31,6 +31,7 @@ pub const Limits = struct {
     pub const change_bytes = 600;
     pub const rule_bytes = 300;
     pub const proposal_bytes = 4 * 1024;
+    pub const last_reply_bytes = 2 * 1024;
 };
 
 pub const scope_id = "scope";
@@ -123,18 +124,21 @@ pub fn approvalState(alloc: Allocator, user_request: []const u8, proposal: []con
 
 pub const close_questions = [_]jev_contract.Question{.{
     .id = closes_id,
-    .instructions = "`user_request` tells the agent that the finished work in `change` is fine and can be closed (for example ok, perfecto, listo, done, cerralo, está bien, looks good, ship it), even when it adds other instructions such as committing or opening a PR; it does not count when it asks for more changes to that work, reports a problem with it, only asks a question, or is about something else",
+    .instructions = "`user_request` accepts the finished work in `change`: it says the work is fine or can be closed (for example ok, perfecto, listo, done, cerralo, está bien, looks good, ship it), usually in reply to `agent_last_reply` asking for a review. It still counts when it adds other instructions such as showing the status, committing or opening a PR. It does not count when it asks for more changes to that work, reports a problem with it, only asks a question, or is about other work",
     .kind = .noul,
 }};
 
 /// State for asking whether the user's message closes `change`. Caller
 /// owns the returned bytes.
-pub fn closeState(alloc: Allocator, user_request: []const u8, change: []const u8) ![]u8 {
+/// `agent_last_reply` is the agent's final answer from the previous turn,
+/// empty when unknown.
+pub fn closeState(alloc: Allocator, user_request: []const u8, change: []const u8, agent_last_reply: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     var jw: std.json.Stringify = .{ .writer = &out.writer };
     try jw.write(.{
         .user_request = turn_text.clip(user_request, Limits.request_bytes),
+        .agent_last_reply = turn_text.clipTail(agent_last_reply, Limits.last_reply_bytes),
         .change = turn_text.clip(change, Limits.proposal_bytes),
     });
     return out.toOwnedSlice();
@@ -634,7 +638,7 @@ test "readyToClose wants an approved change with every task ticked" {
     try std.testing.expectEqualStrings("2026-09-30-trenes.md", readyToClose(&changes, "trenes ok, cerralo").?.file);
     try std.testing.expect(readyToClose(changes[0..2], "ok") == null);
 
-    const state = try closeState(std.testing.allocator, "ok perfecto done", "# Trenes");
+    const state = try closeState(std.testing.allocator, "ok perfecto done", "# Trenes", "");
     defer std.testing.allocator.free(state);
     try std.testing.expect(std.mem.find(u8, state, "\"change\":\"# Trenes\"") != null);
     const notice = try closedAtStop(std.testing.allocator, "2026-09-30-trenes.md");
