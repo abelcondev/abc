@@ -42,6 +42,15 @@ pub fn clip(text: []const u8, max: usize) []const u8 {
     return text[0..end];
 }
 
+/// A UTF-8-safe suffix of at most `max` bytes: the end of an answer is where
+/// it asks the user something.
+pub fn clipTail(text: []const u8, max: usize) []const u8 {
+    if (text.len <= max) return text;
+    var start = text.len - max;
+    while (start < text.len and (text[start] & 0xC0) == 0x80) start += 1;
+    return text[start..];
+}
+
 test "agentMessages keeps the newest messages within the budget" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -62,4 +71,6 @@ test "agentMessages keeps the newest messages within the budget" {
 test "clip never splits a UTF-8 sequence" {
     try std.testing.expectEqualStrings("a", clip("añb", 2));
     try std.testing.expectEqualStrings("añb", clip("añb", 10));
+    try std.testing.expectEqualStrings("b", clipTail("añb", 2));
+    try std.testing.expectEqualStrings("ñb", clipTail("añb", 3));
 }

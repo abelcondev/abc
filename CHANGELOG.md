@@ -1,15 +1,37 @@
 # fx
 
-## 0.4.0
+## 0.5.0
 
 <!-- release:start -->
+
+**Close a finished SDD change by saying "ok", and get one answer per turn instead of two.**
+
+### New Features
+
+- **Close in plain language:** When every task of an approved change is ticked, the agent shows what it did and asks you to review it. Replying "ok perfecto" or "está bien, abrí la PR" closes the change, the same way "sí" approves one. `/sdd done` still works.
+
+### Improvements
+
+- **Status changes reach the agent:** After you run `/sdd approve` or `/sdd done`, the agent learns the new status on its next turn, so it no longer tells you a closed change is still open.
+- **Specs in the same answer:** The agent writes the spec rules and asks for review before its final answer, instead of answering and then summarizing everything again.
+- **Shorter corrections:** When Jev's completion check or a TDD or drift check sends the agent back, it replies with only the correction instead of repeating its whole answer.
+- **Fewer rechecks:** Jev's completion check no longer asks for proof of work from earlier turns, and telling the agent that a pull request was merged needs only an acknowledgement.
+- **Clear notices:** Checks that send the agent back show as a short `↻` line from fx, separate from the agent's text.
+- **`fx jev eval close`:** Runs labeled cases for the close check.
+
+### Bug Fixes
+
+- **The right change:** With several approved changes, fx follows the one the turn is about instead of the first one on disk.
+<!-- release:end -->
+
+## 0.4.0
+
 
 **fx now connects to Meta's Muse models.**
 
 ### New Features
 
 - **Meta Muse provider:** `fx login muse` or `MUSE_API_KEY` connects fx to the Meta Model API with `muse-spark-1.3` (also `muse-spark-1.3-contributor`), including tools, images, a 1M-token context and reasoning levels from `low` to `max`.
-<!-- release:end -->
 
 ## 0.3.3
 

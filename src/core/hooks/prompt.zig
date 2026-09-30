@@ -19,8 +19,12 @@ pub fn buildContinuationMessage(
     );
 }
 
+/// Marks the notice line so it reads as fx, not as the agent.
+pub const continuation_marker = "↻ ";
+
 /// The user-visible line shown when a Stop hook continues the turn: the first
-/// line of the hook context, borrowed from `context`.
+/// line of the hook context, borrowed from `context`. Hook contexts keep that
+/// line short; the rest goes to the model only.
 pub fn continuationNotice(context: []const u8) []const u8 {
     const first_line = context[0 .. std.mem.findScalar(u8, context, '\n') orelse context.len];
     const trimmed = std.mem.trim(u8, first_line, " \t\r");

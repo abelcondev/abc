@@ -12,7 +12,8 @@
 //! one that only ships finished work (commit, PR, release notes), means fix; high stakes means change; an unclear request or an incomplete answer
 //! is sent back to the agent to ask the user; otherwise a confident
 //! "substantial" means change and changed rules mean spec. A proposed change counts as approved when the user's message
-//! approves it.
+//! approves it, and an approved change with every task ticked counts as
+//! done when the user's message confirms the finished work.
 
 const std = @import("std");
 const types = @import("../shared/types.zig");
@@ -30,6 +31,7 @@ pub const Limits = struct {
     pub const change_bytes = 600;
     pub const rule_bytes = 300;
     pub const proposal_bytes = 4 * 1024;
+    pub const last_reply_bytes = 2 * 1024;
 };
 
 pub const scope_id = "scope";
@@ -39,6 +41,7 @@ pub const clear_id = "clear";
 pub const approves_id = "approves_proposal";
 pub const bug_id = "bug_fix";
 pub const publish_id = "publish_only";
+pub const closes_id = "closes_change";
 
 /// Probability at which a request counts as high stakes.
 pub const high_stakes_threshold = 0.6;
@@ -52,6 +55,9 @@ pub const skip_threshold = 0.7;
 pub const clear_threshold = 0.4;
 /// Probability at which the user's message approves the proposed change.
 pub const approval_threshold = 0.8;
+/// Probability at which the user's message confirms a finished change can
+/// be closed.
+pub const close_threshold = 0.8;
 /// Probability at which the request only ships work already done.
 pub const publish_threshold = 0.7;
 /// Probability at which the request reports a bug (it then needs a
@@ -114,6 +120,40 @@ pub fn approvalState(alloc: Allocator, user_request: []const u8, proposal: []con
         .proposal = turn_text.clip(proposal, Limits.proposal_bytes),
     });
     return out.toOwnedSlice();
+}
+
+pub const close_questions = [_]jev_contract.Question{.{
+    .id = closes_id,
+    .instructions = "`user_request` accepts the finished work in `change`: it says the work is fine or can be closed (for example ok, perfecto, listo, done, cerralo, está bien, looks good, ship it), usually in reply to `agent_last_reply` asking for a review. It still counts when it adds other instructions such as showing the status, committing or opening a PR. It does not count when it asks for more changes to that work, reports a problem with it, only asks a question, or is about other work",
+    .kind = .noul,
+}};
+
+/// State for asking whether the user's message closes `change`. Caller
+/// owns the returned bytes.
+/// `agent_last_reply` is the agent's final answer from the previous turn,
+/// empty when unknown.
+pub fn closeState(alloc: Allocator, user_request: []const u8, change: []const u8, agent_last_reply: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    var jw: std.json.Stringify = .{ .writer = &out.writer };
+    try jw.write(.{
+        .user_request = turn_text.clip(user_request, Limits.request_bytes),
+        .agent_last_reply = turn_text.clipTail(agent_last_reply, Limits.last_reply_bytes),
+        .change = turn_text.clip(change, Limits.proposal_bytes),
+    });
+    return out.toOwnedSlice();
+}
+
+/// The approved change whose tasks are all ticked, so the user may close it:
+/// the one `text` names, otherwise the first.
+pub fn readyToClose(changes: []const sdd_layout.Change, text: []const u8) ?sdd_layout.Change {
+    var first: ?sdd_layout.Change = null;
+    for (changes) |change| {
+        if (change.status != .approved or change.tasks_total == 0 or change.tasks_done != change.tasks_total) continue;
+        if (sdd_layout.mentions(text, change.file)) return change;
+        if (first == null) first = change;
+    }
+    return first;
 }
 
 const rule_ids = blk: {
@@ -265,11 +305,19 @@ pub fn changeReason(alloc: Allocator, verdict: Verdict, date: []const u8) ![]u8 
             "## Wireframe\n<only for a new screen: a black-and-white ASCII layout>\n\n## Tasks\n- [ ] <step>\n\n## Notes\n\n" ++
             "Then show it to the user and ask them to approve it. Do not change its `status` yourself (fx does) and do not " ++
             "change other files until it is approved; the user approves by replying yes or with /sdd approve. You tick " ++
-            "the Tasks checkboxes as you finish them.",
+            "the Tasks checkboxes as you finish them. " ++ finish_steps,
         .{date},
     );
     return out.toOwnedSlice();
 }
+
+/// What to do once every task is done, so the specs and the review request
+/// are part of the one final answer.
+const finish_steps =
+    "When every task is done and checked, before your final answer, write the behavior the change added or changed " ++
+    "as rules in " ++ sdd_layout.specs_dir ++ "/<area>.md (one `## ` heading per rule, the current behavior under it, " ++
+    "no history). Then give one final answer that says what changed, which rules you wrote and what you could not " ++
+    "verify, and asks the user to review it and confirm it is ok to close.";
 
 /// Why a file change was held while a proposal waits. Caller owns the text.
 pub fn pendingReason(alloc: Allocator, proposal_file: []const u8) ![]u8 {
@@ -288,7 +336,7 @@ pub fn approvedNotice(alloc: Allocator, proposal_file: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         alloc,
         "SDD: the user's reply approved {s}/{s}; fx set its status to approved. Retry this change and implement it, " ++
-            "ticking each task in its Tasks list (`- [x]`) as you finish it.",
+            "ticking each task in its Tasks list (`- [x]`) as you finish it. " ++ finish_steps,
         .{ sdd_layout.changes_dir, proposal_file },
     );
 }
@@ -322,24 +370,110 @@ pub fn statusCommand(command: []const u8) ?StatusCommand {
     return null;
 }
 
+/// A change's status as fx last saw it at the end of a turn.
+pub const SeenStatus = struct {
+    file: []const u8,
+    status: ?sdd_layout.Status,
+};
+
+pub const StatusChange = struct {
+    file: []const u8,
+    from: ?sdd_layout.Status,
+    to: ?sdd_layout.Status,
+};
+
+/// Changes in `now` whose status differs from `seen`. Files that were not
+/// seen are left out: the agent writes new proposals itself.
+pub fn statusChanges(arena: Allocator, seen: []const SeenStatus, now: []const sdd_layout.Change) ![]const StatusChange {
+    var list: std.ArrayList(StatusChange) = .empty;
+    for (now) |change| {
+        for (seen) |before| {
+            if (!std.mem.eql(u8, before.file, change.file)) continue;
+            if (before.status != change.status) try list.append(arena, .{ .file = change.file, .from = before.status, .to = change.status });
+            break;
+        }
+    }
+    return list.items;
+}
+
+fn statusName(status: ?sdd_layout.Status) []const u8 {
+    return if (status) |value| @tagName(value) else "none";
+}
+
+fn writeStatusChanges(w: *std.Io.Writer, changes: []const StatusChange) !void {
+    try w.writeAll("SDD: the user changed a change's status since your last reply.\n");
+    for (changes) |change| {
+        try w.print("- {s}/{s}: {s} → {s}\n", .{ sdd_layout.changes_dir, change.file, statusName(change.from), statusName(change.to) });
+    }
+    try w.writeAll("The files on disk are current; anything said earlier about these statuses is out of date.");
+}
+
+/// Held once before the first tool call of a turn that follows a status
+/// change the user made (`/sdd approve|done`). Caller owns the text.
+pub fn statusChangedReason(alloc: Allocator, changes: []const StatusChange) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try writeStatusChanges(&out.writer, changes);
+    try out.writer.writeAll(" Retry your call.");
+    return out.toOwnedSlice();
+}
+
+/// Continuation when a final answer names a change whose status the user
+/// changed and no tool call carried the news. Caller owns the text.
+pub fn statusChangedAtStop(alloc: Allocator, changes: []const StatusChange) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try writeStatusChanges(&out.writer, changes);
+    try out.writer.writeAll(
+        " If your answer says otherwise, correct it in one short sentence; do not repeat the rest of your answer. " ++
+            "If it already matches, reply with nothing more than a short confirmation.",
+    );
+    return out.toOwnedSlice();
+}
+
+/// Held once when the user's reply closed a finished change before the
+/// agent's first tool call. Caller owns the text.
+pub fn closedNotice(alloc: Allocator, change_file: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        alloc,
+        "SDD: the user's reply confirmed {s}/{s} is fine; fx set its status to done. Do not ask them to close it " ++
+            "again. Retry your call.",
+        .{ sdd_layout.changes_dir, change_file },
+    );
+}
+
+/// Continuation when the user's reply closed a finished change in a turn
+/// without tool calls. Caller owns the text.
+pub fn closedAtStop(alloc: Allocator, change_file: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        alloc,
+        "SDD: fx closed {s}/{s} (status done) because the user's reply confirmed it.\n" ++
+            "Tell the user in one short sentence that it is closed. Do not repeat the rest of your answer and do not " ++
+            "ask them to run /sdd done.",
+        .{ sdd_layout.changes_dir, change_file },
+    );
+}
+
 pub const self_approve_reason =
     "SDD: only the user approves a change. Do not run `fx sdd approve`. If the user already approved in their " ++
     "message, retry your code change: fx reads their reply and approves it. Otherwise show the proposal and ask them.";
 
 pub const self_done_reason =
-    "SDD: closing a change is the user's call. Do not run `fx sdd done`; tell the user every task is finished " ++
-    "and that they can close it with /sdd done.";
+    "SDD: closing a change is the user's call. Do not run `fx sdd done`; show the user what was done and ask them " ++
+    "to review it and confirm it is ok to close. Their reply closes it (or they run /sdd done).";
 
 /// Continuation after every task of the approved change is done. Caller
 /// owns the text.
 pub fn specsReminder(alloc: Allocator, change_file: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         alloc,
-        "SDD: this turn changed code for {s}/{s}. Tick each finished task in its Tasks list (`- [x]`; the checkboxes " ++
-            "are yours, only `status` belongs to fx). If the change is now complete, write the behavior it added or " ++
-            "changed as rules in {s}/<area>.md (create the file if needed): one `## ` heading per rule, a short " ++
-            "description of the current behavior under it, no history; then tell the user they can close it with " ++
-            "/sdd done. If work remains, say what is left. Then give your final answer.",
+        "SDD: recording {s}/{s} in the specs.\n" ++
+            "The user already sees your previous answer; do not repeat or summarize it. Tick each finished task in its " ++
+            "Tasks list (`- [x]`; the checkboxes are yours, only `status` belongs to fx). If the change is now complete, " ++
+            "write the behavior it added or changed as rules in {s}/<area>.md (create the file if needed): one `## ` " ++
+            "heading per rule, a short description of the current behavior under it, no history. Then reply with only " ++
+            "the rules you wrote and a request to review the work and confirm it is ok to close (their reply closes it, " ++
+            "or /sdd done). If work remains, say only what is left.",
         .{ sdd_layout.changes_dir, change_file, sdd_layout.specs_dir },
     );
 }
@@ -439,6 +573,31 @@ test "statusCommand finds fx sdd approve and done" {
     try std.testing.expect(statusCommand("echo fx sdd") == null);
 }
 
+test "statusChanges reports only seen changes whose status moved" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const seen = [_]SeenStatus{
+        .{ .file = "2026-09-30-trenes.md", .status = .approved },
+        .{ .file = "2026-09-27-brief.md", .status = .done },
+    };
+    const now = [_]sdd_layout.Change{
+        sdd_layout.parseChange("2026-09-27-brief.md", "---\nstatus: done\n---\n"),
+        sdd_layout.parseChange("2026-09-30-trenes.md", "---\nstatus: done\n---\n"),
+        sdd_layout.parseChange("2026-10-01-nuevo.md", "---\nstatus: proposed\n---\n"),
+    };
+    const changes = try statusChanges(arena.allocator(), &seen, &now);
+    try std.testing.expectEqual(@as(usize, 1), changes.len);
+    try std.testing.expectEqualStrings("2026-09-30-trenes.md", changes[0].file);
+    try std.testing.expectEqual(sdd_layout.Status.approved, changes[0].from.?);
+    try std.testing.expectEqual(sdd_layout.Status.done, changes[0].to.?);
+
+    const reason = try statusChangedReason(std.testing.allocator, changes);
+    defer std.testing.allocator.free(reason);
+    try std.testing.expect(std.mem.find(u8, reason, "sdd/changes/2026-09-30-trenes.md: approved → done") != null);
+    try std.testing.expect(sdd_layout.mentions("el doc ventas-trenes sigue en approved", "2026-09-30-ventas-trenes.md"));
+    try std.testing.expect(!sdd_layout.mentions("listo", "2026-09-30-ventas-trenes.md"));
+}
+
 test "reasons name the files to write" {
     const alloc = std.testing.allocator;
     const change = try changeReason(alloc, .{ .route = .change, .high_stakes = 0.9, .substantial = true }, "2026-09-27");
@@ -452,5 +611,30 @@ test "reasons name the files to write" {
     const reminder = try specsReminder(alloc, "2026-09-27-brief.md");
     defer alloc.free(reminder);
     try std.testing.expect(std.mem.find(u8, reminder, "sdd/changes/2026-09-27-brief.md") != null);
-    try std.testing.expect(std.mem.find(u8, reminder, "/sdd done") != null);
+    try std.testing.expect(std.mem.find(u8, reminder, "confirm it is ok to close") != null);
+    try std.testing.expect(std.mem.find(u8, reminder, "do not repeat or summarize it") != null);
+    const approved = try approvedNotice(alloc, "2026-09-27-brief.md");
+    defer alloc.free(approved);
+    try std.testing.expect(std.mem.find(u8, approved, "before your final answer, write the behavior") != null);
+    try std.testing.expect(std.mem.find(u8, change, "before your final answer, write the behavior") != null);
+}
+
+test "readyToClose wants an approved change with every task ticked" {
+    const changes = [_]sdd_layout.Change{
+        sdd_layout.parseChange("2026-09-27-brief.md", "---\nstatus: approved\n---\n- [x] a\n- [ ] b\n"),
+        sdd_layout.parseChange("2026-09-28-empty.md", "---\nstatus: approved\n---\nno tasks\n"),
+        sdd_layout.parseChange("2026-09-29-pagos.md", "---\nstatus: approved\n---\n- [x] a\n"),
+        sdd_layout.parseChange("2026-09-30-trenes.md", "---\nstatus: approved\n---\n- [x] a\n- [X] b\n"),
+        sdd_layout.parseChange("2026-09-26-old.md", "---\nstatus: done\n---\n- [x] a\n"),
+    };
+    try std.testing.expectEqualStrings("2026-09-29-pagos.md", readyToClose(&changes, "ok perfecto").?.file);
+    try std.testing.expectEqualStrings("2026-09-30-trenes.md", readyToClose(&changes, "trenes ok, cerralo").?.file);
+    try std.testing.expect(readyToClose(changes[0..2], "ok") == null);
+
+    const state = try closeState(std.testing.allocator, "ok perfecto done", "# Trenes", "");
+    defer std.testing.allocator.free(state);
+    try std.testing.expect(std.mem.find(u8, state, "\"change\":\"# Trenes\"") != null);
+    const notice = try closedAtStop(std.testing.allocator, "2026-09-30-trenes.md");
+    defer std.testing.allocator.free(notice);
+    try std.testing.expect(std.mem.startsWith(u8, notice, "SDD: fx closed sdd/changes/2026-09-30-trenes.md (status done)"));
 }

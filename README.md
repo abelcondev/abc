@@ -342,9 +342,11 @@ Antes del primer cambio de archivos, Jev pone el pedido en una de tres rutas:
   la propuesta            y escribe las reglas nuevas en sdd/specs
 ```
 
-Aprueba respondiendo "sí" / "sí, dale", o con `/sdd approve`. Cierra con
-`/sdd done`. Solo tú apruebas y cierras: si el agente corre esos comandos por su
-cuenta, fx los frena.
+Aprueba respondiendo "sí" / "sí, dale", o con `/sdd approve`. Cuando todas las
+tareas están marcadas, el agente te muestra lo que hizo y te pide que lo revises;
+cierra respondiendo "ok" / "perfecto, cerralo", o con `/sdd done`. Solo tú
+apruebas y cierras: si el agente corre esos comandos por su cuenta, fx los frena.
+Si cambias un estado con `/sdd`, fx se lo avisa al agente en su siguiente turno.
 
 ```bash
 fx sdd new <slug>          # crea un archivo de cambio a mano
@@ -503,7 +505,7 @@ archivo Markdown por decisión en `sdd/decisions`, `docs/decisions`, `docs/adr`
 o `decisions` (front matter `title`/`status`/`description` opcional). Cada
 registro se marca una vez por sesión.
 
-`fx jev eval [stop|plan|action|ask|routing|sdd]` corre casos etiquetados con las
+`fx jev eval [stop|plan|action|ask|routing|sdd|close]` corre casos etiquetados con las
 mismas preguntas y umbrales que los chequeos reales, para probar cambios de
 umbral o de modelo antes de usarlos.
 

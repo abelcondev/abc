@@ -262,12 +262,16 @@ pub const red_reason =
     "spec (or add `tdd: manual` to the change's front matter), and continue.";
 
 pub const green_reason =
-    "SDD TDD: source files changed after the last passing test run. Run the project's test command now and show " ++
-    "that it passes, fixing the code until it does, before giving your final answer.";
+    "SDD TDD: running the tests after the last source change.\n" ++
+    "Source files changed after the last passing test run. Run the project's test command now and show that it " ++
+    "passes, fixing the code until it does. The user already sees your previous answer; then reply with only the " ++
+    "test result and any fix, without repeating it.";
 
 pub const weak_test_reason =
-    "SDD TDD: Jev judged that the changed tests would still pass without the requested behavior. Tighten them so " ++
-    "they fail when the behavior is missing or wrong, run them, then give your final answer.";
+    "SDD TDD: tightening tests that would pass without the behavior.\n" ++
+    "Jev judged that the changed tests would still pass without the requested behavior. Tighten them so they fail " ++
+    "when the behavior is missing or wrong and run them. The user already sees your previous answer; then reply with " ++
+    "only what you changed in the tests, without repeating it.";
 
 /// Guidance when a fix or spec update spreads too far. Caller owns the text.
 pub fn growthReason(alloc: Allocator, files: usize) ![]u8 {
@@ -305,7 +309,10 @@ pub fn uncitedReason(alloc: Allocator, missing: []const sdd_layout.Rule) ![]u8 {
     const w = &out.writer;
     try w.writeAll("SDD TDD (strict): no test cites these changed rules:\n");
     for (missing) |rule| try w.print("- {s} › {s}\n", .{ rule.capability, rule.title });
-    try w.writeAll("Add a test for each, with a comment such as `// spec: <spec> › <rule>`, run the tests, then give your final answer.");
+    try w.writeAll(
+        "Add a test for each, with a comment such as `// spec: <spec> › <rule>`, and run the tests. The user already " ++
+            "sees your previous answer; then reply with only the tests you added, without repeating it.",
+    );
     return out.toOwnedSlice();
 }
 

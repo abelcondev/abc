@@ -9549,6 +9549,7 @@ fn processQueuedPromptLoop(
                     return;
                 },
                 .continue_once => |context| {
+                    try deps.push_text(deps.ctx, .{ .operational = "\n" ++ hooks.prompt.continuation_marker });
                     try deps.push_text(deps.ctx, .{ .operational = hooks.prompt.continuationNotice(context) });
                     try deps.push_text(deps.ctx, .{ .operational = "\n" });
                     const synthetic = try hooks.prompt.buildContinuationMessage(
@@ -12335,6 +12336,7 @@ fn processQueuedPromptLoop(
                     return;
                 },
                 .continue_once => |context| {
+                    try deps.push_text(deps.ctx, .{ .operational = "\n" ++ hooks.prompt.continuation_marker });
                     try deps.push_text(deps.ctx, .{ .operational = hooks.prompt.continuationNotice(context) });
                     try deps.push_text(deps.ctx, .{ .operational = "\n" });
                     const synthetic = try hooks.prompt.buildContinuationMessage(
