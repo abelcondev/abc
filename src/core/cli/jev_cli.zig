@@ -17,7 +17,7 @@ pub const Action = enum { status, on, off, key, forget, check, eval, drift };
 
 pub const usage =
     \\usage: fx jev [on|off|key|forget|check]
-    \\       fx jev eval [stop|plan|action|ask|routing|sdd|close|tdd|checkpoint|review|visual|drift|edits]
+    \\       fx jev eval [stop|plan|action|ask|routing|sdd|close|tdd|checkpoint|review|visual|drift|edits|memory]
     \\       fx jev drift [<git-range>] [--dir <decisions-dir>]
     \\
 ;
@@ -194,6 +194,10 @@ pub fn renderStatus(alloc: Allocator, config: jev_config.Config, key: KeyStatus,
     }
     if (config.edits_gate) {
         try w.print("  {s}edit_file instead of scripted in-place edits to a few files\n", .{label});
+        label = indent;
+    }
+    if (config.memory_gate) {
+        try w.print("  {s}new memory facts are worth keeping and not repeats\n", .{label});
         label = indent;
     }
     if (config.drift_gate) {

@@ -11,6 +11,8 @@ const types = @import("../core/shared/types.zig");
 const context_contract = @import("../core/workspace/context_contract.zig");
 const context_limits = @import("../core/config/context_limits.zig");
 const prompt_policy_contract = @import("../core/config/prompt_policy.zig");
+const memory_store = @import("../core/memory/memory_store.zig");
+const builtin = @import("builtin");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
@@ -2997,6 +2999,14 @@ fn appendTransient(input: TransientContextInput, arena: Allocator, messages: *st
     try messages.append(arena, .{ .role = .system, .content = content });
     try appendWorkspaceAccessContext(input.access_scope, arena, messages);
     try messages.append(arena, .{ .role = .system, .content = permissionModeContext(input.permission_mode) });
+    // Unit tests never read or create the user's profile memory.
+    if (!builtin.is_test) {
+        if (io_mod.getenv("HOME")) |home| {
+            if (memory_store.contextMessage(arena, home, input.workspace_root) catch null) |memory| {
+                try messages.append(arena, .{ .role = .system, .content = memory });
+            }
+        }
+    }
     if (input.stale_shell_handles) try messages.append(arena, .{
         .role = .system,
         .content = stale_shell_handles_context,

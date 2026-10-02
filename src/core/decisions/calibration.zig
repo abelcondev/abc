@@ -24,11 +24,12 @@ const pr_review = @import("pr_review.zig");
 const visual_check = @import("visual_check.zig");
 const drift = @import("drift.zig");
 const scripted_edit = @import("scripted_edit.zig");
+const memory_gate = @import("memory_gate.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
 
-pub const Gate = enum { stop, plan, action, ask, routing, sdd, close, tdd, checkpoint, review, visual, drift, edits };
+pub const Gate = enum { stop, plan, action, ask, routing, sdd, close, tdd, checkpoint, review, visual, drift, edits, memory };
 
 const Case = struct {
     gate: Gate,
@@ -195,6 +196,7 @@ const saldo_calc_diff =
 ;
 const auth_plan_extra_text = "Plan:\n1. Add a users table migration (id, email unique, password_hash, created_at).\n2. Add POST /signup and POST /login in routes/auth.ts, hashing with argon2.\n3. Issue an httpOnly session cookie on login and add a session middleware.\n4. Also add Google OAuth login and an admin dashboard to manage users.\n5. Tests: signup then login succeeds, wrong password fails, cookie is set. Run bun test.";
 const auth_plan_extra = [_]ChatMessage{.{ .role = .assistant, .content = auth_plan_extra_text }};
+const memory_index = "- [PR flow](pr-flow.md) — one PR per feature against main, never stacked\n- [No attribution](no-attribution.md) — never add AI co-author lines to commits or PRs\n";
 
 const auth_request = "Add user authentication with email and password: a users table, signup and login endpoints, password hashing, and session cookies.";
 const auth_plan = "Plan:\n1. Add a users table migration (id, email unique, password_hash, created_at).\n2. Add POST /signup and POST /login in routes/auth.ts, hashing with argon2.\n3. Issue an httpOnly session cookie on login and add a session middleware.\n4. Tests: signup then login succeeds, wrong password fails, cookie is set. Run bun test.";
@@ -261,6 +263,13 @@ pub const cases = [_]Case{
     .{ .gate = .edits, .name = "rename a tool across files", .expect = "skip", .user_request = "registrar un solo boleto por PDF", .arguments = "{\"command\":\"cd . && perl -pi -e 's/registerMinistryTickets/registerMinistryBoleto/g' src/mimi/tools.ts src/mimi/Mimi.ts src/mimi/adminOps.ts src/lib/mimiChips.ts src/lib/mimiConfirm.ts tests/lib/mimiChips.test.ts\"}" },
     .{ .gate = .edits, .name = "user asks for perl", .expect = "skip", .user_request = "usa perl -pi para cambiar text-left por text-center en src/Card.tsx", .arguments = "{\"command\":\"perl -pi -e 's/text-left/text-center/' src/Card.tsx\"}" },
     .{ .gate = .edits, .name = "sed rename over git grep", .expect = "skip", .user_request = "renombra BookingLite a BookingSummary en todo el proyecto", .arguments = "{\"command\":\"git grep -l BookingLite | xargs sed -i '' 's/BookingLite/BookingSummary/g'\"}" },
+    // Memory facts.
+    .{ .gate = .memory, .name = "build command", .expect = "not_worth", .user_request = "acordate de cómo se compila", .final_message = "---\nname: build\ndescription: how to build\ntype: project\n---\nThe project is written in Zig 0.16 and builds with `zig build`; tests run with `zig build test`." },
+    .{ .gate = .memory, .name = "past fix", .expect = "not_worth", .user_request = "listo, gracias", .final_message = "---\nname: invalid-tool-name-fix\ndescription: fixed InvalidToolName\ntype: project\n---\nFixed the InvalidToolName crash in chat_completions_protocol.zig by renaming unknown tools (commit 3f2a1b)." },
+    .{ .gate = .memory, .name = "working preference", .expect = "save", .user_request = "de ahora en adelante, nunca hagas PRs apilados", .final_message = "---\nname: pr-flow\ndescription: one PR per feature against main, never stacked\ntype: feedback\n---\nOpen one PR per feature against main; never stack PRs.\n**Why:** stacked PRs made reviews and merges painful.\n**How to apply:** branch from main for every item." },
+    .{ .gate = .memory, .name = "deadline", .expect = "save", .user_request = "tenemos que lanzar la 0.6.0 el 15 de octubre para la demo del cliente", .final_message = "---\nname: release-deadline\ndescription: 0.6.0 must ship 2026-10-15 for a client demo\ntype: project\n---\nfx 0.6.0 must be released by 2026-10-15 for a client demo.\n**Why:** the client demo depends on it.\n**How to apply:** prioritize work that unblocks the release." },
+    .{ .gate = .memory, .name = "repeat of an index entry", .expect = "duplicate", .user_request = "recordá que no quiero PRs apilados", .final_message = "---\nname: no-stacked-prs\ndescription: never stack pull requests\ntype: feedback\n---\nNever stack PRs; each feature gets its own PR against main.", .proposal = memory_index },
+    .{ .gate = .memory, .name = "new fact with an index", .expect = "save", .user_request = "el usuario prefiere respuestas en español rioplatense", .final_message = "---\nname: spanish\ndescription: answer in Rioplatense Spanish\ntype: user\n---\nThe user prefers answers in Rioplatense Spanish.", .proposal = memory_index },
 
     // Plan gate.
     .{ .gate = .plan, .name = "typo", .expect = "not_substantial", .user_request = "Fix the typo 'recieve' in README.md", .assistant_text = "I'll fix it.", .tool = "edit_file", .arguments = "{\"path\":\"README.md\"}" },
@@ -403,6 +412,11 @@ pub fn run(arena: Allocator, config: jev_config.Config, api_key: []const u8, cas
             const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, case.arguments, .{});
             state = try scripted_edit.buildState(arena, case.user_request, parsed.object.get("command").?.string);
         },
+        .memory => {
+            const with_index = case.proposal != null;
+            questions = if (with_index) &memory_gate.questions_with_index else &memory_gate.questions_without_index;
+            state = try memory_gate.buildState(arena, case.user_request, case.final_message, case.proposal orelse "");
+        },
         .close => {
             questions = &sdd_gate.close_questions;
             state = try sdd_gate.closeState(arena, case.user_request, case.proposal orelse "", case.assistant_text);
@@ -440,6 +454,7 @@ pub fn run(arena: Allocator, config: jev_config.Config, api_key: []const u8, cas
         else
             "IncompleteJevAnswer",
         .edits => if (response.noul(scripted_edit.targeted_id)) |p| (if (p >= scripted_edit.threshold) "hold" else "skip") else "IncompleteJevAnswer",
+        .memory => if (memory_gate.evaluate(&response, case.proposal != null)) |v| @tagName(v) else "IncompleteJevAnswer",
         .close => if (response.noul(sdd_gate.closes_id)) |p| (if (p >= sdd_gate.close_threshold) "closed" else "open") else "IncompleteJevAnswer",
         .tdd => if (tdd_gate.evaluateNeed(&response)) |need| @tagName(need) else "IncompleteJevAnswer",
     };
