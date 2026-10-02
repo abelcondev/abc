@@ -4383,7 +4383,6 @@ test {
     _ = @import("gateway/typesafe.zig");
     _ = @import("core/decisions/jev_contract.zig");
     _ = @import("core/decisions/jev_config.zig");
-    _ = @import("core/decisions/completion_gate.zig");
     _ = @import("core/decisions/decision_log.zig");
     _ = @import("core/decisions/jev_gate.zig");
     _ = @import("core/decisions/plan_gate.zig");
@@ -4399,8 +4398,6 @@ test {
     _ = @import("core/sdd/sdd_layout.zig");
     _ = @import("core/decisions/sdd_gate.zig");
     _ = @import("core/decisions/tdd_gate.zig");
-    _ = @import("core/decisions/receipts.zig");
-    _ = @import("core/decisions/checkpoint.zig");
     _ = @import("core/decisions/pr_review.zig");
     _ = @import("core/decisions/visual_check.zig");
     _ = @import("core/decisions/scripted_edit.zig");

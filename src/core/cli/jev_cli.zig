@@ -17,7 +17,7 @@ pub const Action = enum { status, on, off, key, forget, check, eval, drift };
 
 pub const usage =
     \\usage: fx jev [on|off|key|forget|check]
-    \\       fx jev eval [stop|plan|action|ask|routing|sdd|close|tdd|checkpoint|review|visual|drift|edits|memory]
+    \\       fx jev eval [plan|action|ask|routing|sdd|close|tdd|review|visual|drift|edits|memory]
     \\       fx jev drift [<git-range>] [--dir <decisions-dir>]
     \\
 ;
@@ -176,10 +176,6 @@ pub fn renderStatus(alloc: Allocator, config: jev_config.Config, key: KeyStatus,
         label = indent;
         try w.print("  {s}test-first behavior changes (with SDD on; Jev decides under `tdd auto`)\n", .{label});
     }
-    if (config.checkpoint_gate) {
-        try w.print("  {s}commit verified earlier work before separate new work (off the default branch)\n", .{label});
-        label = indent;
-    }
     if (config.review_gate) {
         try w.print("  {s}review before a risky or large pull request opens\n", .{label});
         label = indent;
@@ -206,10 +202,6 @@ pub fn renderStatus(alloc: Allocator, config: jev_config.Config, key: KeyStatus,
     }
     if (config.action_gate) {
         try w.print("  {s}action check (hold at damage {d:.2})\n", .{ label, config.action_threshold });
-        label = indent;
-    }
-    if (config.stop_gate) {
-        try w.print("  {s}completion check (threshold {d:.2})\n", .{ label, config.stop_threshold });
         label = indent;
     }
     if (label.ptr != indent.ptr) try w.writeAll("  gates     none\n");
@@ -277,7 +269,7 @@ test "renderStatus reports configuration without the key value" {
     try std.testing.expect(std.mem.find(u8, off, "fx jev key") != null);
     try std.testing.expect(std.mem.find(u8, off, "fx jev on") != null);
 
-    const on = try renderStatus(alloc, .{ .enabled = true, .stop_threshold = 0.6 }, .{ .saved = "macOS Keychain" }, "fx jev on");
+    const on = try renderStatus(alloc, .{ .enabled = true }, .{ .saved = "macOS Keychain" }, "fx jev on");
     defer alloc.free(on);
     try std.testing.expect(std.mem.find(u8, on, "saved in the macOS Keychain") != null);
     try std.testing.expect(std.mem.find(u8, on, "gates     answer settled questions (threshold 0.80)") != null);
@@ -285,6 +277,6 @@ test "renderStatus reports configuration without the key value" {
     try std.testing.expect(std.mem.find(u8, on, "action check") == null);
     try std.testing.expect(std.mem.find(u8, on, "route file changes to fix, spec or change (with SDD on)") != null);
     try std.testing.expect(std.mem.find(u8, on, "test-first behavior changes") != null);
-    try std.testing.expect(std.mem.find(u8, on, "completion check (threshold 0.60)") != null);
+    try std.testing.expect(std.mem.find(u8, on, "completion check") == null);
     try std.testing.expect(std.mem.find(u8, on, "fx jev on") == null);
 }

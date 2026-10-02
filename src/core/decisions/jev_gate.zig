@@ -12,12 +12,14 @@
 //!   off-task or damaging in ways the user did not ask for (at most three
 //!   times per turn).
 //!
-//! The completion gate runs on `Stop`. It sends the agent back once when Jev
-//! cannot confirm the final answer is backed by the turn's tool results.
-//! When the work passes and the turn changed files in a workspace with
-//! decision records and SDD on (`fx sdd on`), the drift check flags records
-//! the uncommitted changes contradict and asks the agent to update them
-//! (each record once per process).
+//! `Stop` runs the after-turn checks: the SDD status and TDD green checks,
+//! the Iris screenshot request after visual changes, and, when the turn
+//! changed files in a workspace with decision records and SDD on
+//! (`fx sdd on`), the drift check, which flags records the uncommitted
+//! changes contradict and asks the agent to update them (each record once
+//! per process). fx does not re-check the final answer against the turn's
+//! tool results: that retry cost a full model round and rarely changed the
+//! answer.
 //!
 //! Gates run for root interactive and `fx ask` turns only. When Jev is
 //! unreachable, has no key, or answers incompletely, the call or turn goes
@@ -31,7 +33,6 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const typesafe = @import("../../gateway/typesafe.zig");
 const jev_contract = @import("jev_contract.zig");
 const jev_config = @import("jev_config.zig");
-const completion_gate = @import("completion_gate.zig");
 const plan_gate = @import("plan_gate.zig");
 const action_gate = @import("action_gate.zig");
 const ask_gate = @import("ask_gate.zig");
@@ -42,8 +43,6 @@ const sdd_mode = @import("../sdd/sdd_mode.zig");
 const sdd_layout = @import("../sdd/sdd_layout.zig");
 const sdd_gate = @import("sdd_gate.zig");
 const tdd_gate = @import("tdd_gate.zig");
-const receipts = @import("receipts.zig");
-const checkpoint = @import("checkpoint.zig");
 const pr_review = @import("pr_review.zig");
 const visual_check = @import("visual_check.zig");
 const scripted_edit = @import("scripted_edit.zig");
@@ -108,14 +107,6 @@ pub const Gate = struct {
     /// This turn already compared the statuses against `sdd_seen` and
     /// checked whether the user's message closes a finished change.
     sdd_turn_started: bool = false,
-    /// Tool call ids of verification runs already recorded this turn. Owned.
-    receipts_seen: std.StringHashMapUnmanaged(void) = .empty,
-    /// Paths already recorded as this turn's work. Owned keys.
-    work_seen: std.StringHashMapUnmanaged(void) = .empty,
-    /// The checkpoint check ran for this turn.
-    checkpoint_settled: bool = false,
-    /// Workspace fingerprint taken at this turn's last Stop. Owned.
-    turn_fingerprint: ?[]u8 = null,
     /// Branches the review gate already held a pull request for. Owned keys.
     reviewed_branches: std.StringHashMapUnmanaged(void) = .empty,
     /// Decision files already flagged by the drift check. Owned keys.
@@ -149,9 +140,6 @@ pub const Gate = struct {
         var reported = self.drift_reported.keyIterator();
         while (reported.next()) |key| self.alloc.free(key.*);
         self.drift_reported.deinit(self.alloc);
-        self.clearReceiptState();
-        self.receipts_seen.deinit(self.alloc);
-        self.work_seen.deinit(self.alloc);
         var reviewed = self.reviewed_branches.keyIterator();
         while (reviewed.next()) |key| self.alloc.free(key.*);
         self.reviewed_branches.deinit(self.alloc);
@@ -161,7 +149,7 @@ pub const Gate = struct {
 
     /// Whether handlers were registered for this runtime.
     pub fn registered(self: *const Gate) bool {
-        return self.config.enabled and (self.config.usesPreToolUse() or self.config.stop_gate);
+        return self.config.enabled and (self.config.usesPreToolUse() or self.config.usesStop());
     }
 
     /// Turns registered handlers on or off for the rest of the process.
@@ -183,9 +171,9 @@ pub const Gate = struct {
                 .run = preToolUseHandler,
             });
         }
-        if (self.config.stop_gate) {
+        if (self.config.usesStop()) {
             try runtime.registerStop(.{
-                .name = "fx.jev.completion",
+                .name = "fx.jev.after_turn",
                 .ctx = self,
                 .run = stopHandler,
             });
@@ -333,17 +321,6 @@ pub const Gate = struct {
         };
     }
 
-    fn clearReceiptState(self: *Gate) void {
-        var seen = self.receipts_seen.keyIterator();
-        while (seen.next()) |key| self.alloc.free(key.*);
-        self.receipts_seen.clearRetainingCapacity();
-        var work = self.work_seen.keyIterator();
-        while (work.next()) |key| self.alloc.free(key.*);
-        self.work_seen.clearRetainingCapacity();
-        if (self.turn_fingerprint) |hex| self.alloc.free(hex);
-        self.turn_fingerprint = null;
-    }
-
     fn clearTouched(self: *Gate) void {
         for (self.sdd_touched.items) |title| self.alloc.free(title);
         self.sdd_touched.clearRetainingCapacity();
@@ -391,8 +368,6 @@ pub const Gate = struct {
         self.sdd_incomplete_held = false;
         self.sdd_approval_checked = false;
         self.sdd_turn_started = false;
-        self.checkpoint_settled = false;
-        self.clearReceiptState();
     }
 
     fn newEntry(self: *const Gate, gate: []const u8, invocation: hooks.Invocation, threshold: f64) decision_log.Entry {
@@ -481,14 +456,6 @@ pub const Gate = struct {
             }
             if (config.sdd_gate and std.mem.eql(u8, tool, "shell")) {
                 if (self.checkStatusCommand(input)) |held| break :blk held;
-            }
-            if (config.checkpoint_gate and !self.checkpoint_settled and plan_gate.isFileChange(tool)) {
-                self.checkpoint_settled = true;
-                const checkpoint_action = self.checkCheckpoint(input) catch |err| cp: {
-                    debug_trace.logf("jev", "checkpoint failed err={s}", .{@errorName(err)});
-                    break :cp hooks.PreToolUseAction.continue_;
-                };
-                if (checkpoint_action != .continue_) break :blk checkpoint_action;
             }
             if (config.review_gate and std.mem.eql(u8, tool, "shell")) {
                 const review_action = self.checkPrReview(input) catch |err| review: {
@@ -1069,12 +1036,6 @@ pub const Gate = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         if (input.invocation.turn_id) |turn| self.resetForTurn(turn);
-        self.recordReceipts(input) catch |err| {
-            debug_trace.logf("jev", "receipts failed err={s}", .{@errorName(err)});
-        };
-        if (self.config.checkpoint_gate) self.recordWork(input) catch |err| {
-            debug_trace.logf("jev", "work log failed err={s}", .{@errorName(err)});
-        };
         if (self.config.sdd_gate) {
             const status_action = self.checkSddAtStop(input) catch |err| status: {
                 self.sdd_turn_started = true;
@@ -1087,178 +1048,41 @@ pub const Gate = struct {
             };
         }
         if (!input.can_continue) return .allow;
-        return self.checkCompletion(input) catch |err| {
-            debug_trace.logf("jev", "completion gate failed err={s}", .{@errorName(err)});
+        return self.afterTurn(input) catch |err| {
+            debug_trace.logf("jev", "after-turn checks failed err={s}", .{@errorName(err)});
             return .allow;
         };
     }
 
-    fn checkCompletion(self: *Gate, input: hooks.StopInput) !hooks.StopAction {
-        var entry = self.newEntry("stop", input.invocation, self.config.stop_threshold);
-        if (self.sdd_change != null) {
-            // The code is held until the user approves the change, so ending
-            // the turn to ask for approval is the expected outcome.
-            entry.outcome = "skip";
-            entry.detail = "waiting for the user to approve the change";
-            decision_log.append(self.alloc, entry);
-            return .allow;
+    /// The checks that may send the agent back once after its answer.
+    fn afterTurn(self: *Gate, input: hooks.StopInput) !hooks.StopAction {
+        // The code is held until the user approves the change, so ending
+        // the turn to ask for approval is the expected outcome.
+        if (self.sdd_change != null) return .allow;
+        if (self.config.sdd_gate) {
+            const tdd_action = self.checkTddStop(input) catch |err| tdd: {
+                debug_trace.logf("jev", "tdd stop check failed err={s}", .{@errorName(err)});
+                break :tdd null;
+            };
+            if (tdd_action) |action| return action;
+            const specs_action = self.checkSpecsForFinishedChange(input) catch |err| specs: {
+                debug_trace.logf("jev", "specs reminder failed err={s}", .{@errorName(err)});
+                break :specs null;
+            };
+            if (specs_action) |action| return action;
         }
-        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena_state.deinit();
-        const state = try completion_gate.buildState(self.alloc, .{
-            .user_request = input.user_request,
-            .final_message = input.assistant_text,
-            .turn_messages = input.turn_messages,
-            .earlier_checks = self.earlierChecks(arena_state.allocator(), input),
-        });
-        defer self.alloc.free(state);
-        var response = self.consult(&entry, state, &completion_gate.questions) orelse return .allow;
-        defer response.deinit();
-        const verdict = completion_gate.evaluate(&response, self.config.stop_threshold) catch |err| {
-            self.logIncomplete(&entry, err);
-            return .allow;
-        };
-        switch (verdict) {
-            .skipped => |reason| {
-                entry.outcome = "skip";
-                entry.detail = reason;
-                decision_log.append(self.alloc, entry);
-                // An agent that says it could not check the UI reads as a
-                // blocker or a question for the user; the capture is how to
-                // check it.
-                if (!std.mem.eql(u8, reason, "not a work request")) {
-                    if (try self.visualAction(input)) |action| return action;
-                }
+        if (try self.visualAction(input)) |action| return action;
+        if (self.config.drift_gate and changedFiles(input.turn_messages) and
+            sdd_mode.load(self.alloc, input.invocation.scope.workspace_root).enabled)
+        {
+            return self.checkDrift(input) catch |err| {
+                debug_trace.logf("jev", "drift check failed err={s}", .{@errorName(err)});
                 return .allow;
-            },
-            .passed => {
-                decision_log.append(self.alloc, entry);
-                if (self.config.sdd_gate) {
-                    const tdd_action = self.checkTddStop(input) catch |err| tdd: {
-                        debug_trace.logf("jev", "tdd stop check failed err={s}", .{@errorName(err)});
-                        break :tdd null;
-                    };
-                    if (tdd_action) |action| return action;
-                    const specs_action = self.checkSpecsForFinishedChange(input) catch |err| specs: {
-                        debug_trace.logf("jev", "specs reminder failed err={s}", .{@errorName(err)});
-                        break :specs null;
-                    };
-                    if (specs_action) |action| return action;
-                }
-                if (try self.visualAction(input)) |action| return action;
-                if (self.config.drift_gate and changedFiles(input.turn_messages) and
-                    sdd_mode.load(self.alloc, input.invocation.scope.workspace_root).enabled)
-                {
-                    return self.checkDrift(input) catch |err| {
-                        debug_trace.logf("jev", "drift check failed err={s}", .{@errorName(err)});
-                        return .allow;
-                    };
-                }
-                return .allow;
-            },
-            .failed => |failed| {
-                entry.outcome = "continue";
-                decision_log.append(self.alloc, entry);
-                return .{ .continue_once = self.lend(try completion_gate.feedback(self.alloc, failed)) };
-            },
+            };
         }
+        return .allow;
     }
 
-    /// Records the turn's verification runs after its last file change, tied
-    /// to the workspace fingerprint. Each run is recorded once.
-    fn recordReceipts(self: *Gate, input: hooks.StopInput) !void {
-        const session_id = input.invocation.scope.session_id orelse return;
-        const root_path = input.invocation.scope.workspace_root;
-        if (self.turn_fingerprint) |hex| self.alloc.free(hex);
-        self.turn_fingerprint = receipts.fingerprint(self.alloc, root_path);
-        const hex = self.turn_fingerprint orelse return;
-        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-        const configured = sdd_mode.load(self.alloc, root_path).testCommand();
-        const runs = try receipts.runsAfterLastChange(arena, input.turn_messages, configured);
-        var fresh: std.ArrayList(receipts.Run) = .empty;
-        for (runs) |run| {
-            if (self.receipts_seen.contains(run.id)) continue;
-            const key = try self.alloc.dupe(u8, run.id);
-            errdefer self.alloc.free(key);
-            try self.receipts_seen.put(self.alloc, key, {});
-            try fresh.append(arena, run);
-        }
-        receipts.record(self.alloc, session_id, input.invocation.turn_id, hex, fresh.items);
-    }
-
-    /// Appends this turn's request and newly changed paths to the work log.
-    fn recordWork(self: *Gate, input: hooks.StopInput) !void {
-        const session_id = input.invocation.scope.session_id orelse return;
-        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-        const paths = try checkpoint.changedPaths(arena, input.invocation.scope.workspace_root, input.turn_messages);
-        var fresh: std.ArrayList([]const u8) = .empty;
-        for (paths) |path| {
-            if (self.work_seen.contains(path)) continue;
-            const key = try self.alloc.dupe(u8, path);
-            errdefer self.alloc.free(key);
-            try self.work_seen.put(self.alloc, key, {});
-            try fresh.append(arena, path);
-        }
-        checkpoint.recordWork(self.alloc, session_id, input.user_request, fresh.items);
-    }
-
-    /// Before the turn's first file change, holds once so the agent commits
-    /// verified earlier work when Jev judges this request separate from it.
-    fn checkCheckpoint(self: *Gate, input: hooks.PreToolUseInput) !hooks.PreToolUseAction {
-        const session_id = input.invocation.scope.session_id orelse return .continue_;
-        const root_path = input.invocation.scope.workspace_root;
-        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-        const pending = checkpoint.pendingWork(arena, session_id, root_path) orelse return .continue_;
-        var entry = self.newEntry("checkpoint", input.invocation, checkpoint.threshold);
-        entry.outcome = "skip";
-        const branch = checkpoint.workBranch(arena, root_path) catch |err| {
-            entry.detail = if (err == error.DefaultBranch) "on the default branch" else "not on a branch";
-            decision_log.append(self.alloc, entry);
-            return .continue_;
-        };
-        const hex = receipts.fingerprint(self.alloc, root_path) orelse return .continue_;
-        defer self.alloc.free(hex);
-        if (!checkpoint.verified(receipts.matching(arena, session_id, hex, 8))) {
-            entry.detail = "no passing run on the current code";
-            decision_log.append(self.alloc, entry);
-            return .continue_;
-        }
-        const state = try checkpoint.buildState(self.alloc, pending.requests, input.user_request, pending.paths);
-        defer self.alloc.free(state);
-        var response = self.consult(&entry, state, &checkpoint.questions) orelse return .continue_;
-        defer response.deinit();
-        const verdict = checkpoint.evaluate(&response) orelse {
-            self.logIncomplete(&entry, error.IncompleteJevAnswer);
-            return .continue_;
-        };
-        entry.outcome = @tagName(verdict);
-        entry.detail = branch;
-        decision_log.append(self.alloc, entry);
-        if (verdict == .keep) return .continue_;
-        return .{ .block = self.lend(try checkpoint.holdReason(self.alloc, branch, pending)) };
-    }
-
-    /// Receipts from earlier turns of this session on exactly the current
-    /// code. Allocated in `arena`.
-    fn earlierChecks(self: *const Gate, arena: Allocator, input: hooks.StopInput) []const receipts.Receipt {
-        const session_id = input.invocation.scope.session_id orelse return &.{};
-        const hex = self.turn_fingerprint orelse return &.{};
-        const found = receipts.matching(arena, session_id, hex, 8);
-        var earlier: std.ArrayList(receipts.Receipt) = .empty;
-        for (found) |receipt| {
-            // Runs from this turn are already in its own evidence. Turn ids
-            // restart when a session resumes, so match by tool call id.
-            if (self.receipts_seen.contains(receipt.call_id)) continue;
-            earlier.append(arena, receipt) catch break;
-        }
-        return earlier.items;
-    }
     fn visualAction(self: *Gate, input: hooks.StopInput) !?hooks.StopAction {
         if (!self.config.visual_gate) return null;
         return self.checkVisual(input) catch |err| {
@@ -1562,7 +1386,7 @@ test "a disabled gate registers no handlers" {
     try std.testing.expect(!view.hasStop());
 }
 
-test "an enabled gate registers the plan and completion handlers" {
+test "an enabled gate registers the pre-tool and after-turn handlers" {
     var runtime = hooks.Runtime.init(std.testing.allocator);
     defer runtime.deinit();
     var gate = Gate{ .alloc = std.testing.allocator, .config = .{ .enabled = true } };
@@ -1596,7 +1420,7 @@ test "the pre-tool handler ignores reads, subagents and settled turns without ca
     try std.testing.expect((try Gate.preToolUseHandler(&gate, settled)) == .continue_);
 }
 
-test "the completion handler allows subagent and final-step turns without calling Jev" {
+test "the after-turn handler allows subagent and final-step turns without calling Jev" {
     var gate = Gate{ .alloc = std.testing.allocator, .config = .{ .enabled = true } };
     defer gate.deinit();
     const base = hooks.StopInput{
@@ -1679,4 +1503,14 @@ test "changedFiles looks for successful file tool results" {
     try std.testing.expect(changedFiles(&edited));
     const failed = [_]types.ChatMessage{.{ .role = .tool, .tool_name = "write_file", .tool_result_status = .failure }};
     try std.testing.expect(!changedFiles(&failed));
+}
+
+test "a gate with no after-turn checks registers no stop handler" {
+    var runtime = hooks.Runtime.init(std.testing.allocator);
+    defer runtime.deinit();
+    var gate = Gate{ .alloc = std.testing.allocator, .config = .{ .enabled = true, .sdd_gate = false, .visual_gate = false, .drift_gate = false } };
+    defer gate.deinit();
+    try gate.register(&runtime);
+    const view = runtime.freeze();
+    try std.testing.expect(!view.hasStop());
 }

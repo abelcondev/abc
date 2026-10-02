@@ -9,8 +9,8 @@
 //! "jev": {
 //!   "enabled": true,
 //!   "model": "jev-latest",
-//!   "gates": { "plan": true, "stop": true, "ask": true, "drift": true, "sdd": true, "action": false },
-//!   "thresholds": { "plan": 0.5, "stop": 0.5, "ask": 0.8, "action": 0.6 },
+//!   "gates": { "plan": true, "ask": true, "drift": true, "sdd": true, "action": false },
+//!   "thresholds": { "plan": 0.5, "ask": 0.8, "action": 0.6 },
 //!   "routing": {
 //!     "light": { "model": "deepseek-flash", "effort": "low" },
 //!     "heavy": { "model": "qwen3.8-max", "description": "hard reasoning or design" }
@@ -42,10 +42,6 @@ pub const Config = struct {
     plan_gate: bool = true,
     /// Minimum probability the plan checks must reach.
     plan_threshold: f64 = 0.5,
-    /// Verify that a turn's claimed work is backed by evidence before it ends.
-    stop_gate: bool = true,
-    /// Minimum probability each completion check must reach.
-    stop_threshold: f64 = 0.5,
     /// Let Jev answer the agent's multiple-choice questions it can settle.
     ask_gate: bool = true,
     /// Minimum confidence and grounding for answering on the user's behalf.
@@ -57,9 +53,6 @@ pub const Config = struct {
     /// With SDD on, route the first file change of a turn to fix, spec or
     /// change (`sdd_gate.zig`).
     sdd_gate: bool = true,
-    /// Commit uncommitted, verified work from earlier turns before a new
-    /// request starts separate work (`checkpoint.zig`).
-    checkpoint_gate: bool = true,
     /// Before the agent opens a pull request, rate the branch's risk and
     /// ask for a review when it is high or large (`pr_review.zig`).
     review_gate: bool = true,
@@ -95,7 +88,12 @@ pub const Config = struct {
 
     /// Whether any gate needs the PreToolUse hook.
     pub fn usesPreToolUse(self: Config) bool {
-        return self.plan_gate or self.ask_gate or self.action_gate or self.sdd_gate or self.checkpoint_gate or self.review_gate or self.edits_gate or self.memory_gate or self.routes.len != 0;
+        return self.plan_gate or self.ask_gate or self.action_gate or self.sdd_gate or self.review_gate or self.edits_gate or self.memory_gate or self.routes.len != 0;
+    }
+
+    /// Whether any after-turn check needs the Stop hook.
+    pub fn usesStop(self: Config) bool {
+        return self.sdd_gate or self.visual_gate or self.drift_gate;
     }
 
     fn setModel(self: *Config, alloc: Allocator, value: []const u8) !void {
@@ -128,9 +126,6 @@ pub fn applyJson(alloc: Allocator, config: *Config, value: std.json.Value) !void
     }
     if (object.get("gates")) |gates| {
         if (gates == .object) {
-            if (gates.object.get("stop")) |stop| {
-                if (stop == .bool) config.stop_gate = stop.bool;
-            }
             if (gates.object.get("plan")) |plan| {
                 if (plan == .bool) config.plan_gate = plan.bool;
             }
@@ -145,9 +140,6 @@ pub fn applyJson(alloc: Allocator, config: *Config, value: std.json.Value) !void
             }
             if (gates.object.get("sdd")) |sdd| {
                 if (sdd == .bool) config.sdd_gate = sdd.bool;
-            }
-            if (gates.object.get("checkpoint")) |checkpoint_value| {
-                if (checkpoint_value == .bool) config.checkpoint_gate = checkpoint_value.bool;
             }
             if (gates.object.get("review")) |review| {
                 if (review == .bool) config.review_gate = review.bool;
@@ -165,9 +157,6 @@ pub fn applyJson(alloc: Allocator, config: *Config, value: std.json.Value) !void
     }
     if (object.get("thresholds")) |thresholds| {
         if (thresholds == .object) {
-            if (thresholds.object.get("stop")) |stop| {
-                if (threshold(stop)) |parsed| config.stop_threshold = parsed;
-            }
             if (thresholds.object.get("plan")) |plan| {
                 if (threshold(plan)) |parsed| config.plan_threshold = parsed;
             }
@@ -359,7 +348,7 @@ pub fn loadApiKey(alloc: Allocator) !?ApiKey {
 test "applyJson reads the jev settings object and ignores invalid fields" {
     const alloc = std.testing.allocator;
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"enabled":true,"model":"jev-1.13.0","base_url":"http://insecure","gates":{"stop":false,"plan":false},"thresholds":{"stop":0.7,"plan":0.6}}
+        \\{"enabled":true,"model":"jev-1.13.0","base_url":"http://insecure","gates":{"stop":false,"checkpoint":false,"visual":false,"plan":false},"thresholds":{"stop":0.7,"plan":0.6}}
     , .{});
     defer parsed.deinit();
     var config = Config{};
@@ -368,13 +357,13 @@ test "applyJson reads the jev settings object and ignores invalid fields" {
     try std.testing.expect(config.enabled);
     try std.testing.expectEqualStrings("jev-1.13.0", config.model);
     try std.testing.expectEqualStrings(typesafe.default_base_url, config.base_url);
-    try std.testing.expect(!config.stop_gate);
-    try std.testing.expectEqual(@as(f64, 0.7), config.stop_threshold);
+    // Retired gates in old settings are ignored.
+    try std.testing.expect(!config.visual_gate);
     try std.testing.expect(!config.plan_gate);
     try std.testing.expectEqual(@as(f64, 0.6), config.plan_threshold);
 
     var bad = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"enabled":"yes","model":"has space","thresholds":{"stop":1.5}}
+        \\{"enabled":"yes","model":"has space","thresholds":{"plan":1.5}}
     , .{});
     defer bad.deinit();
     var defaults = Config{};
@@ -382,7 +371,7 @@ test "applyJson reads the jev settings object and ignores invalid fields" {
     try applyJson(alloc, &defaults, bad.value);
     try std.testing.expect(!defaults.enabled);
     try std.testing.expectEqualStrings(default_model, defaults.model);
-    try std.testing.expectEqual(@as(f64, 0.5), defaults.stop_threshold);
+    try std.testing.expectEqual(@as(f64, 0.5), defaults.plan_threshold);
 }
 
 test "applyJson reads routes and the ask and action gates" {
