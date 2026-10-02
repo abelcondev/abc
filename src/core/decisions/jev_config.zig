@@ -63,6 +63,12 @@ pub const Config = struct {
     /// Before the agent opens a pull request, rate the branch's risk and
     /// ask for a review when it is high or large (`pr_review.zig`).
     review_gate: bool = true,
+    /// After a turn that changed how a UI looks, ask for an Iris screenshot
+    /// (`visual_check.zig`).
+    visual_gate: bool = true,
+    /// Vision model for a subagent that reads the screenshot when the
+    /// session's model cannot (`jev.visual.model`).
+    visual_model: ?[]const u8 = null,
     /// Check file changes and shell commands against the request.
     action_gate: bool = false,
     /// Probability of unrequested damage at which an action is held.
@@ -71,8 +77,10 @@ pub const Config = struct {
     routes: []routing.Route = &.{},
     owned_model: ?[]u8 = null,
     owned_base_url: ?[]u8 = null,
+    owned_visual_model: ?[]u8 = null,
 
     pub fn deinit(self: *Config, alloc: Allocator) void {
+        if (self.owned_visual_model) |value| alloc.free(value);
         if (self.owned_model) |value| alloc.free(value);
         if (self.owned_base_url) |value| alloc.free(value);
         freeRoutes(alloc, self.routes);
@@ -138,6 +146,9 @@ pub fn applyJson(alloc: Allocator, config: *Config, value: std.json.Value) !void
             if (gates.object.get("review")) |review| {
                 if (review == .bool) config.review_gate = review.bool;
             }
+            if (gates.object.get("visual")) |visual| {
+                if (visual == .bool) config.visual_gate = visual.bool;
+            }
         }
     }
     if (object.get("thresholds")) |thresholds| {
@@ -153,6 +164,18 @@ pub fn applyJson(alloc: Allocator, config: *Config, value: std.json.Value) !void
             }
             if (thresholds.object.get("action")) |action| {
                 if (threshold(action)) |parsed| config.action_threshold = parsed;
+            }
+        }
+    }
+    if (object.get("visual")) |visual| {
+        if (visual == .object) {
+            if (visual.object.get("model")) |model| {
+                if (model == .string and validText(model.string)) {
+                    const owned = try alloc.dupe(u8, model.string);
+                    if (config.owned_visual_model) |old| alloc.free(old);
+                    config.owned_visual_model = owned;
+                    config.visual_model = owned;
+                }
             }
         }
     }
