@@ -7137,7 +7137,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(connections).toBe(7);
       expect(requests).toBe(6);
       expect(socketFailure).toBeUndefined();
-      expect(trace).toContain("event=receive_head_error");
+      // The reset can land while fx is still writing the request or while it
+      // waits for the response head; both are the same network interruption.
+      expect(trace).toMatch(/event=(request_send_error|receive_head_error)/);
       expect(trace).toContain("provider_attempts=6/10");
       expect(trace).toContain("recovery=retry_request");
     } finally {
