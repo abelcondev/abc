@@ -22,11 +22,12 @@ const receipts = @import("receipts.zig");
 const checkpoint = @import("checkpoint.zig");
 const pr_review = @import("pr_review.zig");
 const visual_check = @import("visual_check.zig");
+const drift = @import("drift.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
 
-pub const Gate = enum { stop, plan, action, ask, routing, sdd, close, tdd, checkpoint, review, visual };
+pub const Gate = enum { stop, plan, action, ask, routing, sdd, close, tdd, checkpoint, review, visual, drift };
 
 const Case = struct {
     gate: Gate,
@@ -48,7 +49,8 @@ const Case = struct {
     /// Requests and files behind the uncommitted work (checkpoint cases).
     previous: []const []const u8 = &.{},
     files: []const []const u8 = &card_paths,
-    /// Branch diff and its changed lines (review cases).
+    /// Branch diff and its changed lines (review cases), or the diff checked
+    /// against `rules[0]` (drift cases).
     diff: []const u8 = "",
     changed_lines: usize = 0,
 };
@@ -158,6 +160,38 @@ const moved_section = toolTurn("c1", "edit_file", "{\"path\":\"src/components/bo
 const saved_notes = toolTurn("c1", "edit_file", "{\"path\":\"src/components/booking/CreateBookingSheet.tsx\",\"old_string\":\"const patch = ministryVentaPatch({ boleto1, boleto2 });\",\"new_string\":\"const patch = ministryVentaPatch({ boleto1, boleto2, notes });\"}", .success, "Edited");
 const renamed_prop = toolTurn("c1", "edit_file", "{\"path\":\"src/components/booking/BookingMinisterio.tsx\",\"old_string\":\"const tickets = useMinistryTickets(bookingId);\",\"new_string\":\"const ministryTickets = useMinistryTickets(bookingId);\"}", .success, "Edited");
 const badge_text = toolTurn("c1", "edit_file", "{\"path\":\"src/components/tickets/MinistryBoletoFields.tsx\",\"old_string\":\"<Badge tone=\\\"teal\\\">Registrado</Badge>\",\"new_string\":\"<Badge tone=\\\"teal\\\"><CheckIcon strokeWidth={3} /> Registrado</Badge>\"}", .success, "Edited");
+const coverage_rules = [_]sdd_layout.Rule{.{ .capability = "ministerio", .title = "Cobertura", .body = "La reserva tiene cobertura de Ministerio (✓) cuando tiene una fila de ministryTickets no borrada." }};
+const coverage_diff =
+    \\--- a/src/lib/ministryRegistry.ts
+    \\+++ b/src/lib/ministryRegistry.ts
+    \\-  return tickets.some((t) => !t.deletedAt);
+    \\+  return tickets.some((t) => !t.deletedAt && Boolean(t.boleto));
+;
+const edit_sheet_rules = [_]sdd_layout.Rule{.{ .capability = "ministerio", .title = "Edición del boleto", .body = "El sheet de edición muestra el selector Reserva (booking), Boleto 1 y Boleto 2." }};
+const edit_sheet_diff =
+    \\--- a/src/components/tickets/MinisterioTicketSheet.tsx
+    \\+++ b/src/components/tickets/MinisterioTicketSheet.tsx
+    \\-      <BookingSelect value={bookingId} onChange={setBookingId} />
+    \\       <Select label="Boleto 1" value={boleto1} options={MINISTRY_BOLETOS} />
+    \\       <Select label="Boleto 2" value={boleto2} options={MINISTRY_BOLETOS} />
+    \\+      <Textarea label="Comentarios" value={notes} onChange={setNotes} />
+;
+const columns_diff =
+    \\--- a/src/components/booking/ReservasList.tsx
+    \\+++ b/src/components/booking/ReservasList.tsx
+    \\-  const columns = [ref, categoria, fechas, nombre, pax, whatsapp, grupo, pais, estado, asesor, saldo, ministerio];
+    \\+  const columns = [ref, categoria, fechas, nombre, pax, whatsapp, grupo, pais, estado, saldo, asesor, ministerio];
+;
+const saldo_calc_diff =
+    \\--- a/src/lib/payments.ts
+    \\+++ b/src/lib/payments.ts
+    \\-  return booking.amount - paid(booking.payments);
+    \\+  return booking.amount;
+    \\--- a/src/components/tickets/MinistryBoletoFields.tsx
+    \\+++ b/src/components/tickets/MinistryBoletoFields.tsx
+    \\-      <div className="flex flex-wrap items-center gap-3">
+    \\+      <div className="flex min-w-0 items-center gap-3 text-center">
+;
 
 const auth_request = "Add user authentication with email and password: a users table, signup and login endpoints, password hashing, and session cookies.";
 const auth_plan = "Plan:\n1. Add a users table migration (id, email unique, password_hash, created_at).\n2. Add POST /signup and POST /login in routes/auth.ts, hashing with argon2.\n3. Issue an httpOnly session cookie on login and add a session middleware.\n4. Tests: signup then login succeeds, wrong password fails, cookie is set. Run bun test.";
@@ -211,6 +245,12 @@ pub const cases = [_]Case{
     .{ .gate = .visual, .name = "bold check in the badge", .expect = "visual", .user_request = "en el badge 'Registrado' que vaya con un icono check bold", .messages = &badge_text },
     .{ .gate = .visual, .name = "persist the comment", .expect = "skip", .user_request = "el comentario del step de ministerio no se guarda, arreglalo", .messages = &saved_notes },
     .{ .gate = .visual, .name = "rename a variable", .expect = "skip", .user_request = "renombra tickets a ministryTickets en BookingMinisterio", .messages = &renamed_prop },
+    // Drift direction: which side to change when a turn contradicts a rule.
+    .{ .gate = .drift, .name = "coverage now needs the real boleto", .expect = "update_record", .user_request = "la cobertura tiene que marcar check solo cuando hay boleto real registrado por el rol Reservas", .rules = &coverage_rules, .diff = coverage_diff },
+    .{ .gate = .drift, .name = "comments added, booking selector dropped", .expect = "ask_user", .user_request = "en la edicion de Ministerio agrega el campo Comentarios", .rules = &edit_sheet_rules, .diff = edit_sheet_diff },
+    .{ .gate = .drift, .name = "selector removal was asked", .expect = "update_record", .user_request = "quitar de edicion de Ministerio en el detalle de la reserva el campo Reserva (booking) y agregar comentarios", .rules = &edit_sheet_rules, .diff = edit_sheet_diff },
+    .{ .gate = .drift, .name = "reorder columns as asked", .expect = "update_record", .user_request = "Move the Saldo column so it comes right before Asesor in the reservas table", .rules = reservas_rules[0..1], .diff = columns_diff },
+    .{ .gate = .drift, .name = "balance broken while centering", .expect = "fix_code", .user_request = "centra la fecha en el card de Ministerio", .rules = reservas_rules[1..2], .diff = saldo_calc_diff },
 
     // Plan gate.
     .{ .gate = .plan, .name = "typo", .expect = "not_substantial", .user_request = "Fix the typo 'recieve' in README.md", .assistant_text = "I'll fix it.", .tool = "edit_file", .arguments = "{\"path\":\"README.md\"}" },
@@ -341,6 +381,11 @@ pub fn run(arena: Allocator, config: jev_config.Config, api_key: []const u8, cas
             questions = &visual_check.questions;
             state = try visual_check.buildState(arena, case.user_request, try visual_check.scan(arena, case.messages));
         },
+        .drift => {
+            const decisions = [_]drift.Decision{drift.ruleDecision("spec.md", case.rules[0])};
+            questions = try drift.contradictionQuestions(arena, 1, true);
+            state = try drift.contradictionState(arena, case.diff, &decisions, case.user_request);
+        },
         .close => {
             questions = &sdd_gate.close_questions;
             state = try sdd_gate.closeState(arena, case.user_request, case.proposal orelse "", case.assistant_text);
@@ -373,6 +418,10 @@ pub fn run(arena: Allocator, config: jev_config.Config, api_key: []const u8, cas
         .checkpoint => if (checkpoint.evaluate(&response)) |verdict| @tagName(verdict) else "IncompleteJevAnswer",
         .review => if (pr_review.evaluate(&response, case.changed_lines)) |v| reviewTag(v) else "IncompleteJevAnswer",
         .visual => if (response.noul(visual_check.visual_id)) |p| (if (p >= visual_check.threshold) "visual" else "skip") else "IncompleteJevAnswer",
+        .drift => if (drift.contradiction(&response, 0)) |p|
+            (if (p < drift.contradiction_threshold) "no_contradiction" else @tagName(drift.Direction.of(drift.originFor(&response, 0))))
+        else
+            "IncompleteJevAnswer",
         .close => if (response.noul(sdd_gate.closes_id)) |p| (if (p >= sdd_gate.close_threshold) "closed" else "open") else "IncompleteJevAnswer",
         .tdd => if (tdd_gate.evaluateNeed(&response)) |need| @tagName(need) else "IncompleteJevAnswer",
     };
