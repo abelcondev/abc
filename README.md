@@ -261,6 +261,16 @@ specs o registros de decisiones y termina con error si alguno puede estar
 desactualizado.
 
 Cada decisión de Jev queda registrada en `~/.fx/sessions/<id>/decisions.jsonl`.
+
+**Recibos de verificación.** Al terminar cada turno, fx guarda en
+`~/.fx/sessions/<id>/receipts.jsonl` las corridas de tests y de build que
+vinieron después del último cambio de archivos, junto con una huella del código
+(el commit actual más el contenido de cada archivo cambiado o nuevo, sin contar
+`sdd/`). En los turnos siguientes, el chequeo de terminado acepta esas corridas
+como respaldo mientras la huella no cambie: "los tests pasan" de hace tres
+turnos sigue valiendo hasta que se toque el código, y una corrida que falló
+nunca respalda un "todo en verde".
+
 Todas las opciones están en [Configuración de Jev](#configuración-de-jev).
 
 ## SDD: specs antes de los cambios grandes
@@ -437,7 +447,7 @@ respuesta, gestor de paquetes, dónde viven los tests).
 | Proveedor, modelo, permisos, Jev | `~/.fx/settings.json` | `FX_PROVIDER`, `FX_MODEL`, `FX_PERMISSION_MODE`, `FX_JEV=on\|off` |
 | SDD y TDD, por proyecto | `~/.fx/settings.json` → `workspaces["<ruta>"].sdd` | `FX_SDD=on\|off` |
 | Valores del proyecto que se pueden commitear | `<proyecto>/.fx.json` | |
-| Sesiones y registro de decisiones de Jev | `~/.fx/sessions/<id>/` (`decisions.jsonl`) | |
+| Sesiones, registro de decisiones y recibos de Jev | `~/.fx/sessions/<id>/` (`decisions.jsonl`, `receipts.jsonl`) | |
 
 Fuera de macOS, las keys guardadas van a un archivo privado en
 `~/.fx/provider-keys`. La configuración de Jev y SDD vive solo en tu perfil: el

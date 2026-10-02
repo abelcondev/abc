@@ -42,6 +42,7 @@ const sdd_mode = @import("../sdd/sdd_mode.zig");
 const sdd_layout = @import("../sdd/sdd_layout.zig");
 const sdd_gate = @import("sdd_gate.zig");
 const tdd_gate = @import("tdd_gate.zig");
+const receipts = @import("receipts.zig");
 const turn_text = @import("turn_text.zig");
 
 const Allocator = std.mem.Allocator;
@@ -94,6 +95,10 @@ pub const Gate = struct {
     /// This turn already compared the statuses against `sdd_seen` and
     /// checked whether the user's message closes a finished change.
     sdd_turn_started: bool = false,
+    /// Tool call ids of verification runs already recorded this turn. Owned.
+    receipts_seen: std.StringHashMapUnmanaged(void) = .empty,
+    /// Workspace fingerprint taken at this turn's last Stop. Owned.
+    turn_fingerprint: ?[]u8 = null,
     /// Decision files already flagged by the drift check. Owned keys.
     drift_reported: std.StringHashMapUnmanaged(void) = .empty,
 
@@ -125,6 +130,8 @@ pub const Gate = struct {
         var reported = self.drift_reported.keyIterator();
         while (reported.next()) |key| self.alloc.free(key.*);
         self.drift_reported.deinit(self.alloc);
+        self.clearReceiptState();
+        self.receipts_seen.deinit(self.alloc);
         self.config.deinit(self.alloc);
         self.* = undefined;
     }
@@ -303,6 +310,14 @@ pub const Gate = struct {
         };
     }
 
+    fn clearReceiptState(self: *Gate) void {
+        var seen = self.receipts_seen.keyIterator();
+        while (seen.next()) |key| self.alloc.free(key.*);
+        self.receipts_seen.clearRetainingCapacity();
+        if (self.turn_fingerprint) |hex| self.alloc.free(hex);
+        self.turn_fingerprint = null;
+    }
+
     fn clearTouched(self: *Gate) void {
         for (self.sdd_touched.items) |title| self.alloc.free(title);
         self.sdd_touched.clearRetainingCapacity();
@@ -347,6 +362,7 @@ pub const Gate = struct {
         self.sdd_incomplete_held = false;
         self.sdd_approval_checked = false;
         self.sdd_turn_started = false;
+        self.clearReceiptState();
     }
 
     fn newEntry(self: *const Gate, gate: []const u8, invocation: hooks.Invocation, threshold: f64) decision_log.Entry {
@@ -891,6 +907,9 @@ pub const Gate = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         if (input.invocation.turn_id) |turn| self.resetForTurn(turn);
+        self.recordReceipts(input) catch |err| {
+            debug_trace.logf("jev", "receipts failed err={s}", .{@errorName(err)});
+        };
         if (self.config.sdd_gate) {
             const status_action = self.checkSddAtStop(input) catch |err| status: {
                 self.sdd_turn_started = true;
@@ -919,10 +938,13 @@ pub const Gate = struct {
             decision_log.append(self.alloc, entry);
             return .allow;
         }
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
         const state = try completion_gate.buildState(self.alloc, .{
             .user_request = input.user_request,
             .final_message = input.assistant_text,
             .turn_messages = input.turn_messages,
+            .earlier_checks = self.earlierChecks(arena_state.allocator(), input),
         });
         defer self.alloc.free(state);
         var response = self.consult(&entry, state, &completion_gate.questions) orelse return .allow;
@@ -968,6 +990,46 @@ pub const Gate = struct {
                 return .{ .continue_once = self.lend(try completion_gate.feedback(self.alloc, failed)) };
             },
         }
+    }
+
+    /// Records the turn's verification runs after its last file change, tied
+    /// to the workspace fingerprint. Each run is recorded once.
+    fn recordReceipts(self: *Gate, input: hooks.StopInput) !void {
+        const session_id = input.invocation.scope.session_id orelse return;
+        const root_path = input.invocation.scope.workspace_root;
+        if (self.turn_fingerprint) |hex| self.alloc.free(hex);
+        self.turn_fingerprint = receipts.fingerprint(self.alloc, root_path);
+        const hex = self.turn_fingerprint orelse return;
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const configured = sdd_mode.load(self.alloc, root_path).testCommand();
+        const runs = try receipts.runsAfterLastChange(arena, input.turn_messages, configured);
+        var fresh: std.ArrayList(receipts.Run) = .empty;
+        for (runs) |run| {
+            if (self.receipts_seen.contains(run.id)) continue;
+            const key = try self.alloc.dupe(u8, run.id);
+            errdefer self.alloc.free(key);
+            try self.receipts_seen.put(self.alloc, key, {});
+            try fresh.append(arena, run);
+        }
+        receipts.record(self.alloc, session_id, input.invocation.turn_id, hex, fresh.items);
+    }
+
+    /// Receipts from earlier turns of this session on exactly the current
+    /// code. Allocated in `arena`.
+    fn earlierChecks(self: *const Gate, arena: Allocator, input: hooks.StopInput) []const receipts.Receipt {
+        const session_id = input.invocation.scope.session_id orelse return &.{};
+        const hex = self.turn_fingerprint orelse return &.{};
+        const found = receipts.matching(arena, session_id, hex, 8);
+        var earlier: std.ArrayList(receipts.Receipt) = .empty;
+        for (found) |receipt| {
+            // Runs from this turn are already in its own evidence. Turn ids
+            // restart when a session resumes, so match by tool call id.
+            if (self.receipts_seen.contains(receipt.call_id)) continue;
+            earlier.append(arena, receipt) catch break;
+        }
+        return earlier.items;
     }
 
     /// A turn that approves the proposal but changes no code (pushing, opening

@@ -10,6 +10,7 @@
 const std = @import("std");
 const types = @import("../shared/types.zig");
 const jev_contract = @import("jev_contract.zig");
+const receipts = @import("receipts.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
@@ -18,6 +19,8 @@ pub const Input = struct {
     user_request: []const u8,
     final_message: []const u8,
     turn_messages: []const ChatMessage,
+    /// Verification runs from earlier turns on exactly the current code.
+    earlier_checks: []const receipts.Receipt = &.{},
 };
 
 pub const Limits = struct {
@@ -34,7 +37,6 @@ pub const work_done_id = "work_done";
 pub const claims_supported_id = "claims_supported";
 pub const not_finished_id = "not_finished";
 pub const needs_user_id = "needs_user";
-pub const checked_id = "checked";
 
 pub const questions = [_]jev_contract.Question{
     .{
@@ -53,7 +55,7 @@ pub const questions = [_]jev_contract.Question{
     },
     .{
         .id = claims_supported_id,
-        .instructions = "Every statement in `final_message` about work done or checks passed in this turn is backed by a matching tool result in `evidence`. Statements that `final_message` presents as coming from earlier turns (for example done before, verified earlier, ya aplicado antes) are background and need no evidence here; a statement about the current state of a file, branch or pull request still does",
+        .instructions = "Every statement in `final_message` about work done or checks passed in this turn is backed by a matching tool result in `evidence`, or by a run in `checks_on_current_code` (test and build runs recorded in earlier turns on exactly the code as it is now, which still hold). Statements that `final_message` presents as coming from earlier turns (for example done before, verified earlier, ya aplicado antes) are background and need no evidence here; a statement about the current state of a file, branch or pull request still does",
         .kind = .noul,
     },
     // Two atomic questions: a single "blocked or asks the user" question
@@ -66,11 +68,6 @@ pub const questions = [_]jev_contract.Question{
     .{
         .id = needs_user_id,
         .instructions = "`final_message` asks the user for information or a decision without which the work in `user_request` cannot be finished",
-        .kind = .noul,
-    },
-    .{
-        .id = checked_id,
-        .instructions = "After its last change, the agent ran a check in `evidence` (tests, a build, running the program, or reading the result back) and that check succeeded",
         .kind = .noul,
     },
 };
@@ -177,6 +174,14 @@ pub fn buildState(alloc: Allocator, input: Input) ![]u8 {
     if (start > 0) {
         try jw.objectField("earlier_evidence_omitted");
         try jw.write(start);
+    }
+    if (input.earlier_checks.len != 0) {
+        try jw.objectField("checks_on_current_code");
+        try jw.beginArray();
+        for (input.earlier_checks) |check| {
+            try jw.write(.{ .kind = @tagName(check.kind), .command = check.command, .ok = check.ok, .output_tail = check.summary });
+        }
+        try jw.endArray();
     }
     try jw.endObject();
     return out.toOwnedSlice();
