@@ -1,8 +1,39 @@
 # fx
 
-## 0.5.0
+## 0.6.0
 
 <!-- release:start -->
+
+**Jev now decides more of the work: when a change needs a test first, when to commit, when a pull request needs a review, and what to remember.**
+
+### New Features
+
+- **StepFun provider:** `STEPFUN_API_KEY` connects fx to StepFun with `step-5-preview` (1M-token context, images), `step-3.7-flash`, `step-3.5-flash` and `step-3.5-flash-2603`, all with tools and reasoning levels `low`, `medium` and `high`.
+- **Workspace memory:** fx keeps facts across sessions for each workspace in `~/.fx/memory/`, one markdown file per fact plus a `MEMORY.md` index the agent sees on every request. Jev skips facts the repository already records and asks to update a fact instead of saving a near-duplicate. Turn it off with `"memory": {"enabled": false}` or `FX_MEMORY=off`.
+- **Automatic checkpoint commits:** When a new request is separate from earlier uncommitted work and the tests passed on that exact code, fx has the agent commit only the files the earlier work touched before it starts. It never commits on the default branch and never stages your unrelated edits. Turn it off with `jev.gates.checkpoint`.
+- **Pull request review by risk:** Before `gh pr create` or `gh pr ready`, Jev rates the branch's risk. Risky changes such as permissions, money, data deletion or migrations get a full review of the diff and a `## Review` section in the pull request. Turn it off with `jev.gates.review`.
+- **Visual check with Iris:** When a turn changes the UI and Iris is registered as an MCP server, the agent takes a screenshot and compares it with the request before finishing. Without Iris, fx says once that the check was skipped. Turn it off with `jev.gates.visual`.
+
+### Improvements
+
+- **Test-first only when it helps:** The new default `tdd: auto` lets Jev decide. Behavior changes and bug fixes stay test-first; presentation and trivial changes skip the failing-test step but still need passing tests. A `(manual)` marker added mid-turn now takes effect right away.
+- **Completion claims stay backed:** fx records test and build runs together with the code they ran on, so "tests pass" from an earlier turn counts until the code changes, and a failing run never backs a green claim.
+- **Spec or code:** When the code contradicts a spec, Jev decides which side is wrong. Changes you asked for update the spec, accidental changes are undone in the code, and unclear cases are asked to you.
+- **Safer edits:** Targeted edits made with `sed -i`, `perl -pi` or inline scripts are steered to `edit_file`, whose exact matching keeps files from breaking silently. Bulk renames you ask for still run.
+- **One plan, not two:** When a plan adds or misses steps, the agent replies with only the amendment instead of writing the whole plan again.
+
+### Bug Fixes
+
+- **Unknown tool names:** A turn no longer stops with `InvalidToolName` when the model names a tool that does not exist. The model is told the tool is unsupported and continues.
+- **StepFun tool calls:** Tool call arguments streamed by StepFun are no longer cut short.
+
+### Security
+
+- **Memory paths as data:** Workspace paths and memory index lines are encoded before they reach the model, so a crafted directory name cannot inject instructions.
+<!-- release:end -->
+
+## 0.5.0
+
 
 **Close a finished SDD change by saying "ok", and get one answer per turn instead of two.**
 
@@ -22,7 +53,6 @@
 ### Bug Fixes
 
 - **The right change:** With several approved changes, fx follows the one the turn is about instead of the first one on disk.
-<!-- release:end -->
 
 ## 0.4.0
 
