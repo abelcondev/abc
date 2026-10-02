@@ -1316,7 +1316,7 @@ pub const Gate = struct {
             .base_url = self.config.base_url,
             .api_key = key.value,
             .model = self.config.model,
-        }, root_path, "HEAD", dir_path) catch |err| {
+        }, root_path, "HEAD", dir_path, input.user_request) catch |err| {
             entry.outcome = "unavailable";
             entry.detail = @errorName(err);
             entry.latency_ms = io_mod.milliTimestamp() - started;

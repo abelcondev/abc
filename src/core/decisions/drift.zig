@@ -29,6 +29,36 @@ pub const Limits = struct {
 pub const relevance_threshold = 0.5;
 /// 0.55 rather than 0.5: live answers at 0.50-0.52 were ambiguous in practice.
 pub const contradiction_threshold = 0.55;
+/// Confidence the origin answer needs before fx picks a side.
+pub const origin_confidence = 0.5;
+
+const origin_choices = [_]jev_contract.Option{
+    .{ .name = "asked", .description = "`user_request` asks for exactly this change in behavior" },
+    .{ .name = "side_effect", .description = "`user_request` asks for something else, and this change came along with it without being asked for" },
+};
+
+/// Which side a contradiction is resolved on.
+pub const Origin = struct {
+    asked: bool,
+    confidence: f64,
+};
+
+pub const Direction = enum {
+    /// The user asked for the new behavior; the record is out of date.
+    update_record,
+    /// Nothing asked for the change; the code drifted from the record.
+    fix_code,
+    /// Unclear; the user decides before either side changes.
+    ask_user,
+    /// No request to judge against (`fx jev drift`).
+    unknown,
+
+    pub fn of(origin: ?Origin) Direction {
+        const known = origin orelse return .unknown;
+        if (known.confidence < origin_confidence) return .ask_user;
+        return if (known.asked) .update_record else .fix_code;
+    }
+};
 
 pub const Decision = struct {
     /// File name, e.g. `014-mimi-agent.md`.
@@ -115,6 +145,19 @@ const relevant_instructions = blk: {
     );
     break :blk list;
 };
+const requested_ids = blk: {
+    var list: [Limits.max_decisions][]const u8 = undefined;
+    for (0..Limits.max_decisions) |index| list[index] = std.fmt.comptimePrint("requested_{d}", .{index});
+    break :blk list;
+};
+const requested_instructions = blk: {
+    var list: [Limits.max_decisions][]const u8 = undefined;
+    for (0..Limits.max_decisions) |index| list[index] = std.fmt.comptimePrint(
+        "Where the part of `diff` that no longer matches `decisions[{d}].text` comes from",
+        .{index},
+    );
+    break :blk list;
+};
 const contradicts_ids = blk: {
     var list: [Limits.max_decisions][]const u8 = undefined;
     for (0..Limits.max_decisions) |index| list[index] = std.fmt.comptimePrint("contradicts_{d}", .{index});
@@ -135,9 +178,14 @@ pub fn relevanceQuestions(arena: Allocator, count: usize) ![]const jev_contract.
     return list;
 }
 
-pub fn contradictionQuestions(arena: Allocator, count: usize) ![]const jev_contract.Question {
-    const list = try arena.alloc(jev_contract.Question, count);
-    for (list, 0..) |*question, index| question.* = .{ .id = contradicts_ids[index], .instructions = contradicts_instructions[index], .kind = .noul };
+/// One contradiction question per decision, plus, with a request, whether
+/// the request asked for each departure.
+pub fn contradictionQuestions(arena: Allocator, count: usize, with_request: bool) ![]const jev_contract.Question {
+    const list = try arena.alloc(jev_contract.Question, if (with_request) count * 2 else count);
+    for (0..count) |index| {
+        list[index] = .{ .id = contradicts_ids[index], .instructions = contradicts_instructions[index], .kind = .noul };
+        if (with_request) list[count + index] = .{ .id = requested_ids[index], .instructions = requested_instructions[index], .kind = .{ .choice = &origin_choices } };
+    }
     return list;
 }
 
@@ -160,7 +208,7 @@ pub fn relevanceState(alloc: Allocator, diff: []const u8, decisions: []const Dec
 
 /// State for the contradiction call over `selected` decisions, whose text
 /// shares a byte budget. Caller owns the returned bytes.
-pub fn contradictionState(alloc: Allocator, diff: []const u8, selected: []const Decision) ![]u8 {
+pub fn contradictionState(alloc: Allocator, diff: []const u8, selected: []const Decision, user_request: ?[]const u8) ![]u8 {
     const per_decision = if (selected.len == 0) 0 else @min(Limits.body_bytes, Limits.bodies_bytes / selected.len);
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
@@ -172,6 +220,10 @@ pub fn contradictionState(alloc: Allocator, diff: []const u8, selected: []const 
     try jw.beginArray();
     for (selected) |decision| try jw.write(.{ .title = decision.title, .text = turn_text.clip(decision.body, per_decision) });
     try jw.endArray();
+    if (user_request) |request| {
+        try jw.objectField("user_request");
+        try jw.write(turn_text.clip(request, 4 * 1024));
+    }
     try jw.endObject();
     return out.toOwnedSlice();
 }
@@ -194,6 +246,11 @@ pub fn contradiction(response: *const jev_contract.Response, index: usize) ?f64 
     return response.noul(contradicts_ids[index]);
 }
 
+pub fn originFor(response: *const jev_contract.Response, index: usize) ?Origin {
+    const answer = response.choice(requested_ids[index]) orelse return null;
+    return .{ .asked = std.mem.eql(u8, answer.choice, "asked"), .confidence = answer.confidence };
+}
+
 pub const default_dirs = [_][]const u8{ sdd_layout.specs_dir, "sdd/decisions", "docs/decisions", "docs/adr", "decisions" };
 
 pub const Jev = struct {
@@ -207,6 +264,12 @@ pub const Finding = struct {
     touched: f64,
     contradiction: f64,
     stale: bool,
+    /// Whether the turn's request asked for the departure; null without one.
+    origin: ?Origin = null,
+
+    pub fn direction(self: Finding) Direction {
+        return Direction.of(self.origin);
+    }
 };
 
 pub const Report = struct {
@@ -234,8 +297,10 @@ pub fn findDir(root: std.Io.Dir) ?[]const u8 {
 }
 
 /// Checks `git diff <range>` in `root` against the decisions in `dir_path`
-/// (relative to `root`). Everything in the report is allocated in `arena`.
-pub fn check(arena: Allocator, jev: Jev, root_path: []const u8, range: []const u8, dir_path: []const u8) !Report {
+/// (relative to `root`). With `user_request`, each finding also says whether
+/// the request asked for the change. Everything in the report is allocated
+/// in `arena`.
+pub fn check(arena: Allocator, jev: Jev, root_path: []const u8, range: []const u8, dir_path: []const u8, user_request: ?[]const u8) !Report {
     const io = io_mod.getIo();
     var root = try std.Io.Dir.cwd().openDir(io, root_path, .{});
     defer root.close(io);
@@ -297,8 +362,8 @@ pub fn check(arena: Allocator, jev: Jev, root_path: []const u8, range: []const u
         .base_url = jev.base_url,
         .api_key = jev.api_key,
         .model = jev.model,
-        .state_json = try contradictionState(arena, diff, selected),
-        .questions = try contradictionQuestions(arena, selected.len),
+        .state_json = try contradictionState(arena, diff, selected, user_request),
+        .questions = try contradictionQuestions(arena, selected.len, user_request != null),
     });
     defer contradiction_response.deinit();
 
@@ -310,6 +375,7 @@ pub fn check(arena: Allocator, jev: Jev, root_path: []const u8, range: []const u
             .touched = relevance(&relevance_response, relevant[index]).?,
             .contradiction = p,
             .stale = p >= contradiction_threshold,
+            .origin = if (user_request != null) originFor(&contradiction_response, index) else null,
         };
     }
     report.findings = findings;
@@ -326,25 +392,42 @@ pub fn feedback(alloc: Allocator, dir: []const u8, stale: []const Finding) ![]u8
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const w = &out.writer;
-    if (std.mem.eql(u8, dir, sdd_layout.specs_dir)) {
-        try w.writeAll("Jev spec check: the changes in this turn may contradict these spec rules:\n");
-        for (stale) |finding| try w.print("- {s}/{s} › {s} (p={d:.2})\n", .{ dir, finding.decision.file, finding.decision.title, finding.contradiction });
-        try w.writeAll(
-            "Read each rule. If the change is intended, rewrite the rule under its `## ` heading so it describes the " ++
-                "behavior as it is now (a spec holds only current behavior, not history). If the change was a mistake, " ++
-                "fix the code instead. The user already sees your previous answer; then reply with only which rules you " ++
-                "updated or what you fixed, without repeating it.",
-        );
-        return out.toOwnedSlice();
+    const specs = std.mem.eql(u8, dir, sdd_layout.specs_dir);
+    const noun = if (specs) "spec rules" else "decision records";
+    try w.print("Jev spec check: the changes in this turn may contradict these {s}:\n", .{noun});
+    var counts = std.EnumArray(Direction, usize).initFill(0);
+    for (stale) |finding| {
+        counts.getPtr(finding.direction()).* += 1;
+        if (specs) {
+            try w.print("- {s}/{s} › {s} (p={d:.2}", .{ dir, finding.decision.file, finding.decision.title, finding.contradiction });
+        } else {
+            try w.print("- {s}/{s} \"{s}\" (p={d:.2}", .{ dir, finding.decision.file, finding.decision.title, finding.contradiction });
+        }
+        try w.print("){s}\n", .{switch (finding.direction()) {
+            .update_record => ": the request asked for this, update it",
+            .fix_code => ": the request did not ask for this, fix the code",
+            .ask_user => ": unclear, ask the user",
+            .unknown => "",
+        }});
     }
-    try w.writeAll("Jev spec check: the changes in this turn may contradict these decision records:\n");
-    for (stale) |finding| try w.print("- {s}/{s} \"{s}\" (p={d:.2})\n", .{ dir, finding.decision.file, finding.decision.title, finding.contradiction });
-    try w.writeAll(
-        "Read each record. If the change is intended, update the record so it describes the code as it is now " ++
-            "(keep its format and add a short note of what changed). If the change was a mistake, fix the code instead. " ++
-            "The user already sees your previous answer; then reply with only which records you updated or what you " ++
-            "fixed, without repeating it.",
-    );
+    const update_how = if (specs)
+        "rewrite the rule under its `## ` heading so it describes the behavior as it is now (a spec holds only current behavior, not history)"
+    else
+        "update the record so it describes the code as it is now (keep its format and add a short note of what changed)";
+    if (counts.get(.unknown) != 0) {
+        try w.print("Read each one. If the change is intended, {s}. If the change was a mistake, fix the code instead. ", .{update_how});
+    }
+    if (counts.get(.update_record) != 0) try w.print("For the ones marked update: {s}. ", .{update_how});
+    if (counts.get(.fix_code) != 0) {
+        try w.writeAll("For the ones marked fix the code: the user's request did not ask for this departure, so change the code back " ++
+            "to match the text; do not edit the text to fit the code. Only undo what you changed in this turn: if the departure was " ++
+            "already uncommitted before this turn, it may be the user's work in progress, so leave it and tell the user. If you are " ++
+            "sure the text is wrong, ask the user instead. ");
+    }
+    if (counts.get(.ask_user) != 0) {
+        try w.writeAll("For the ones marked ask: do not change the code or the text yet; ask the user which one is right, quoting the text. ");
+    }
+    try w.writeAll("The user already sees your previous answer; reply with only what you updated, fixed or are asking, without repeating it.");
     return out.toOwnedSlice();
 }
 
@@ -399,6 +482,39 @@ test "states and questions line up by index" {
     const questions = try relevanceQuestions(arena, 2);
     try std.testing.expectEqualStrings("relevant_1", questions[1].id);
     try std.testing.expect(std.mem.find(u8, questions[1].instructions, "`decisions[1]`") != null);
-    const contradictions = try contradictionQuestions(arena, 1);
+    const contradictions = try contradictionQuestions(arena, 1, false);
     try std.testing.expect(std.mem.find(u8, contradictions[0].instructions, "`decisions[0].text`") != null);
+}
+
+test "direction follows whether the request asked for the change" {
+    try std.testing.expectEqual(Direction.update_record, Direction.of(.{ .asked = true, .confidence = 0.9 }));
+    try std.testing.expectEqual(Direction.fix_code, Direction.of(.{ .asked = false, .confidence = 0.8 }));
+    try std.testing.expectEqual(Direction.ask_user, Direction.of(.{ .asked = false, .confidence = 0.3 }));
+    try std.testing.expectEqual(Direction.unknown, Direction.of(null));
+}
+
+test "feedback tells the agent which side to change" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const rules = try sdd_layout.parseRules(arena.allocator(), "ministerio", "## Coverage\nCovered when a row exists.\n## Edit sheet\nShows the booking selector.\n");
+    const findings = [_]Finding{
+        .{ .decision = ruleDecision("ministerio.md", rules[0]), .touched = 0.9, .contradiction = 0.8, .stale = true, .origin = .{ .asked = true, .confidence = 0.9 } },
+        .{ .decision = ruleDecision("ministerio.md", rules[1]), .touched = 0.9, .contradiction = 0.7, .stale = true, .origin = .{ .asked = false, .confidence = 0.9 } },
+    };
+    const text = try feedback(std.testing.allocator, sdd_layout.specs_dir, &findings);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.find(u8, text, "› Coverage (p=0.80): the request asked for this, update it") != null);
+    try std.testing.expect(std.mem.find(u8, text, "› Edit sheet (p=0.70): the request did not ask for this, fix the code") != null);
+    try std.testing.expect(std.mem.find(u8, text, "do not edit the text to fit the code") != null);
+    try std.testing.expect(std.mem.find(u8, text, "If the change is intended") == null);
+}
+
+test "contradiction questions add the request question per decision" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const questions = try contradictionQuestions(arena.allocator(), 2, true);
+    try std.testing.expectEqual(@as(usize, 4), questions.len);
+    try std.testing.expectEqualStrings("requested_1", questions[3].id);
+    const state = try contradictionState(arena.allocator(), "+x", &.{.{ .file = "a.md", .title = "A", .status = "", .summary = "", .body = "b" }}, "do x");
+    try std.testing.expect(std.mem.find(u8, state, "\"user_request\":\"do x\"") != null);
 }

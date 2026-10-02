@@ -17,7 +17,7 @@ pub const Action = enum { status, on, off, key, forget, check, eval, drift };
 
 pub const usage =
     \\usage: fx jev [on|off|key|forget|check]
-    \\       fx jev eval [stop|plan|action|ask|routing|sdd|close|tdd|checkpoint|review|visual]
+    \\       fx jev eval [stop|plan|action|ask|routing|sdd|close|tdd|checkpoint|review|visual|drift]
     \\       fx jev drift [<git-range>] [--dir <decisions-dir>]
     \\
 ;
@@ -63,7 +63,7 @@ pub fn drift(alloc: Allocator, config: jev_config.Config, api_key: []const u8, o
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const dir_path = options.dir orelse drift_mod.findDir(std.Io.Dir.cwd()) orelse return error.NoDecisionsDirectory;
-    const report = try drift_mod.check(arena, .{ .base_url = config.base_url, .api_key = api_key, .model = config.model }, ".", options.range, dir_path);
+    const report = try drift_mod.check(arena, .{ .base_url = config.base_url, .api_key = api_key, .model = config.model }, ".", options.range, dir_path, null);
     if (report.decision_count == 0) return error.NoDecisions;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
