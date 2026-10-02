@@ -127,6 +127,7 @@ definida.
 | `zai`, `zhipu` | `ZAI_API_KEY`, `ZHIPUAI_API_KEY` | GLM (Z.ai / BigModel) |
 | `minimax` | `MINIMAX_API_KEY` | api.minimax.io |
 | `muse` | `MUSE_API_KEY` | Meta Model API, api.meta.ai (`muse-spark-1.3`, `muse-spark-1.3-contributor`; sirve con la key de un plan de Muse Code; probado de punta a punta) |
+| `stepfun` | `STEPFUN_API_KEY` | api.stepfun.ai (`step-5-preview`, `step-3.7-flash`, `step-3.5-flash`, `step-3.5-flash-2603`; probado de punta a punta) |
 | `openrouter` | `OPENROUTER_API_KEY` | openrouter.ai |
 | `openai`, `anthropic`, `gemini`, `xai`, `mistral` | `<NOMBRE>_API_KEY` | endpoints compatibles con OpenAI de cada proveedor |
 | `groq`, `together`, `fireworks`, `siliconflow` | `<NOMBRE>_API_KEY` | endpoints compatibles con OpenAI de cada proveedor |
