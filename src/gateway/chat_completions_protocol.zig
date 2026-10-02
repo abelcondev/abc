@@ -91,6 +91,11 @@ fn validate_name(name: []const u8) Error!void {
     for (name) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-' and byte != '.') return error.InvalidToolName;
 }
 
+/// Prefix for a lenient call to a tool that was not advertised. No builtin or
+/// MCP tool (`mcp_…`) uses it, so the runtime answers `unknown tool: …` and
+/// the model can retry, and an unadvertised but registered tool never runs.
+pub const unadvertised_prefix = "fx_unadvertised__";
+
 fn append_function(alloc: Allocator, functions: *std.ArrayList(Function), function: Function) Error!void {
     try validate_name(function.name);
     if (functions.items.len == max_selected_tools) return error.TooManyTools;
@@ -1192,11 +1197,26 @@ pub const Reducer = struct {
                     try append_bounded(self.alloc, &tool.name, fragment, @min(max_name_bytes, self.limits.identity_bytes), error.IdentityTooLarge);
                     var prefix = false;
                     for (self.names.items) |name| prefix = prefix or std.mem.startsWith(u8, name, tool.name.items);
-                    if (!prefix) return error.InvalidToolName;
+                    // Lenient streams keep the call; finish renames it so it
+                    // can never run.
+                    if (!prefix and !self.limits.lenient) return error.InvalidToolName;
                 }
                 if (non_null(function, "arguments")) |arguments| try append_bounded(self.alloc, &tool.arguments, try string(arguments), self.limits.arguments_bytes, error.ArgumentsTooLarge);
             }
         }
+    }
+
+    /// Rewrites an unadvertised tool name to `unadvertised_prefix` plus its
+    /// printable, bounded form.
+    fn renameUnadvertised(self: *Reducer, name: *std.ArrayList(u8)) Error!void {
+        var renamed: std.ArrayList(u8) = .empty;
+        errdefer renamed.deinit(self.alloc);
+        try renamed.appendSlice(self.alloc, unadvertised_prefix);
+        const keep = name.items[0..@min(name.items.len, max_name_bytes - unadvertised_prefix.len)];
+        for (keep) |byte| try renamed.append(self.alloc, if (std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-' or byte == '.') byte else '_');
+        if (keep.len == 0) try renamed.appendSlice(self.alloc, "unnamed");
+        name.deinit(self.alloc);
+        name.* = renamed;
     }
 
     fn known_name(self: *const Reducer, name: []const u8) bool {
@@ -1285,7 +1305,10 @@ pub const Reducer = struct {
         defer self.alloc.free(diagnostics);
         for (self.tools.items, integrities, diagnostics) |*tool, *integrity, *diagnostic| {
             if (tool.id == null) return error.InvalidToolCallId;
-            if (!self.known_name(tool.name.items)) return error.InvalidToolName;
+            if (!self.known_name(tool.name.items)) {
+                if (!self.limits.lenient) return error.InvalidToolName;
+                try self.renameUnadvertised(&tool.name);
+            }
             integrity.* = .valid;
             diagnostic.* = null;
             if (!self.limits.lenient) {
@@ -3058,12 +3081,19 @@ test "lenient chat completions maps vendor finish reasons" {
     try std.testing.expectError(error.InvalidFinishReason, parse_finish_reason("eos", false));
 }
 
-test "lenient chat completions still rejects unknown tools and malformed arguments" {
-    try std.testing.expectError(error.InvalidToolName, test_lenient_result(&.{
-        "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"a\",\"function\":{\"name\":\"rm_rf\",\"arguments\":\"{}\"}}]}}]}",
-        test_tools_finish,
-        "[DONE]",
-    }));
+test "lenient chat completions renames unknown tools so they cannot run" {
+    const alloc = std.testing.allocator;
+    const unknown = "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"a\",\"function\":{\"name\":\"rm_rf\",\"arguments\":\"{}\"}},{\"index\":1,\"id\":\"b\",\"function\":{\"name\":\"edit file<|sep|>\",\"arguments\":\"{}\"}}]}}]}";
+    var result = try test_lenient_result(&.{ unknown, test_tools_finish, "[DONE]" });
+    defer result.deinit(alloc);
+    const calls = result.completed.completion.tool_calls;
+    try std.testing.expectEqual(@as(usize, 2), calls.len);
+    try std.testing.expectEqualStrings("fx_unadvertised__rm_rf", calls[0].name);
+    try std.testing.expectEqualStrings("fx_unadvertised__edit_file__sep__", calls[1].name);
+    // Strict mode still fails closed on the same name.
+    var strict = try Reducer.init(alloc, test_tool_request(), .{});
+    defer strict.deinit();
+    try std.testing.expectError(error.InvalidToolName, test_accept(&strict, unknown));
 }
 
 test "lenient chat completions marks malformed arguments instead of failing the turn" {
