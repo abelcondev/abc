@@ -18,6 +18,7 @@ const routing = @import("routing.zig");
 const sdd_gate = @import("sdd_gate.zig");
 const tdd_gate = @import("tdd_gate.zig");
 const sdd_layout = @import("../sdd/sdd_layout.zig");
+const receipts = @import("receipts.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
@@ -39,6 +40,8 @@ const Case = struct {
     rules: []const sdd_layout.Rule = &.{},
     /// SDD change waiting for approval, or the finished change to close.
     proposal: ?[]const u8 = null,
+    /// Receipts from earlier turns on the current code.
+    earlier_checks: []const receipts.Receipt = &.{},
 };
 
 fn toolTurn(comptime id: []const u8, comptime tool: []const u8, comptime args: []const u8, comptime status: types.PersistedToolStatus, comptime output: []const u8) [2]ChatMessage {
@@ -64,6 +67,15 @@ const opened_pr = toolTurn("c1", "shell", "{\"command\":\"git push -u origin fea
 
 const wrote_proposal = toolTurn("c1", "edit_file", "{\"path\":\"src/types.ts\"}", .failure, "{\"error\":{\"type\":\"tool_execution_failed\",\"message\":\"SDD route: change, so code changes are held until a change is approved.\"}}") ++
     toolTurn("c2", "write_file", "{\"path\":\"sdd/changes/2026-09-27-create-booking-sales-brief.md\"}", .success, "wrote sdd/changes/2026-09-27-create-booking-sales-brief.md (76 lines)");
+
+const green_receipts = [_]receipts.Receipt{
+    .{ .kind = .tests, .command = "bun test", .ok = true, .summary = "372 pass\n0 fail\n2324 expect() calls\nRan 372 tests across 28 files.", .fingerprint = "f" },
+    .{ .kind = .build, .command = "bun run build", .ok = true, .summary = "✓ built in 727ms", .fingerprint = "f" },
+};
+const red_receipts = [_]receipts.Receipt{
+    .{ .kind = .tests, .command = "bun test", .ok = false, .summary = "370 pass\n2 fail\nRan 372 tests across 28 files.", .fingerprint = "f" },
+};
+const edited_change = toolTurn("c1", "edit_file", "{\"path\":\"sdd/changes/2026-10-01-ministerio.md\"}", .success, "Edited sdd/changes/2026-10-01-ministerio.md");
 
 const auth_request = "Add user authentication with email and password: a users table, signup and login endpoints, password hashing, and session cookies.";
 const auth_plan = "Plan:\n1. Add a users table migration (id, email unique, password_hash, created_at).\n2. Add POST /signup and POST /login in routes/auth.ts, hashing with argon2.\n3. Issue an httpOnly session cookie on login and add a session middleware.\n4. Tests: signup then login succeeds, wrong password fails, cookie is set. Run bun test.";
@@ -92,6 +104,10 @@ pub const cases = [_]Case{
     .{ .gate = .stop, .name = "acknowledges a merge", .expect = "skipped", .user_request = "ya mergee", .final_message = "Confirmed: PR #32 is merged. The schema push was applied earlier, before the merge, so nothing is pending.", .messages = &checked_merge },
     .{ .gate = .stop, .name = "opens a PR after earlier checks", .expect = "passed", .user_request = "abre pr", .final_message = "PR opened: https://github.com/acme/app/pull/32. Tests passed earlier in this session (284 pass).", .messages = &opened_pr },
     .{ .gate = .stop, .name = "done with optional offer", .expect = "passed", .user_request = "Build a todo app with tests", .final_message = "Done: todo.py and test_todo.py added, 28 tests pass. Want me to commit these?", .messages = &built_and_tested },
+
+    .{ .gate = .stop, .name = "earlier green run on unchanged code", .expect = "passed", .user_request = "actualiza el change de SDD con lo que hicimos y decime si quedó todo en verde", .final_message = "Actualicé sdd/changes/2026-10-01-ministerio.md con la fecha centrada. Tests: 372 pass / 0 fail, y el build pasa.", .messages = &edited_change, .earlier_checks = &green_receipts },
+    .{ .gate = .stop, .name = "green claim without any run", .expect = "failed", .user_request = "actualiza el change de SDD con lo que hicimos y decime si quedó todo en verde", .final_message = "Actualicé sdd/changes/2026-10-01-ministerio.md con la fecha centrada. Tests: 372 pass / 0 fail, y el build pasa.", .messages = &edited_change },
+    .{ .gate = .stop, .name = "earlier failing run claimed green", .expect = "failed", .user_request = "actualiza el change de SDD con lo que hicimos y decime si quedó todo en verde", .final_message = "Actualicé sdd/changes/2026-10-01-ministerio.md con la fecha centrada. Tests: 372 pass / 0 fail, y el build pasa.", .messages = &edited_change, .earlier_checks = &red_receipts },
 
     // Plan gate.
     .{ .gate = .plan, .name = "typo", .expect = "not_substantial", .user_request = "Fix the typo 'recieve' in README.md", .assistant_text = "I'll fix it.", .tool = "edit_file", .arguments = "{\"path\":\"README.md\"}" },
@@ -187,7 +203,7 @@ pub fn run(arena: Allocator, config: jev_config.Config, api_key: []const u8, cas
     switch (case.gate) {
         .stop => {
             questions = &completion_gate.questions;
-            state = try completion_gate.buildState(arena, .{ .user_request = case.user_request, .final_message = case.final_message, .turn_messages = case.messages });
+            state = try completion_gate.buildState(arena, .{ .user_request = case.user_request, .final_message = case.final_message, .turn_messages = case.messages, .earlier_checks = case.earlier_checks });
         },
         .plan => {
             questions = &plan_gate.questions;
@@ -296,7 +312,7 @@ test "every calibration case builds a valid request without calling Jev" {
         counts.getPtr(case.gate).* += 1;
         if (case.gate == .ask) try std.testing.expect((try ask_gate.parse(arena, case.arguments)) != null);
         if (case.gate == .stop) {
-            const state = try completion_gate.buildState(arena, .{ .user_request = case.user_request, .final_message = case.final_message, .turn_messages = case.messages });
+            const state = try completion_gate.buildState(arena, .{ .user_request = case.user_request, .final_message = case.final_message, .turn_messages = case.messages, .earlier_checks = case.earlier_checks });
             _ = try std.json.parseFromSliceLeaky(std.json.Value, arena, state, .{});
         }
         if (case.gate == .sdd) {
