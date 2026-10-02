@@ -17,7 +17,7 @@ pub const Action = enum { status, on, off, key, forget, check, eval, drift };
 
 pub const usage =
     \\usage: fx jev [on|off|key|forget|check]
-    \\       fx jev eval [stop|plan|action|ask|routing|sdd|close|tdd|checkpoint|review]
+    \\       fx jev eval [stop|plan|action|ask|routing|sdd|close|tdd|checkpoint|review|visual]
     \\       fx jev drift [<git-range>] [--dir <decisions-dir>]
     \\
 ;
@@ -182,6 +182,14 @@ pub fn renderStatus(alloc: Allocator, config: jev_config.Config, key: KeyStatus,
     }
     if (config.review_gate) {
         try w.print("  {s}review before a risky or large pull request opens\n", .{label});
+        label = indent;
+    }
+    if (config.visual_gate) {
+        if (config.visual_model) |model| {
+            try w.print("  {s}Iris screenshot after visual changes (vision subagent: {s})\n", .{ label, model });
+        } else {
+            try w.print("  {s}Iris screenshot after visual changes\n", .{label});
+        }
         label = indent;
     }
     if (config.drift_gate) {

@@ -21,11 +21,12 @@ const sdd_layout = @import("../sdd/sdd_layout.zig");
 const receipts = @import("receipts.zig");
 const checkpoint = @import("checkpoint.zig");
 const pr_review = @import("pr_review.zig");
+const visual_check = @import("visual_check.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
 
-pub const Gate = enum { stop, plan, action, ask, routing, sdd, close, tdd, checkpoint, review };
+pub const Gate = enum { stop, plan, action, ask, routing, sdd, close, tdd, checkpoint, review, visual };
 
 const Case = struct {
     gate: Gate,
@@ -152,6 +153,11 @@ const filter_diff =
     \\+  return bookings.filter((b) => (!from || b.startDate >= from) && (!to || b.startDate <= to));
     \\+}
 ;
+const centered_date = toolTurn("c1", "edit_file", "{\"path\":\"src/components/tickets/MinistryBoletoFields.tsx\",\"old_string\":\"<div className=\\\"flex flex-wrap items-center gap-3\\\">\",\"new_string\":\"<div className=\\\"flex items-center\\\"><div className=\\\"min-w-0 flex-1 text-center\\\">\"}", .success, "Edited");
+const moved_section = toolTurn("c1", "edit_file", "{\"path\":\"src/components/booking/BookingDetail.tsx\",\"old_string\":\"<BookingTrenes bookingId={bookingId} />\",\"new_string\":\"<BookingTrenes bookingId={bookingId} />\\n<BookingMinisterio bookingId={bookingId} />\"}", .success, "Edited");
+const saved_notes = toolTurn("c1", "edit_file", "{\"path\":\"src/components/booking/CreateBookingSheet.tsx\",\"old_string\":\"const patch = ministryVentaPatch({ boleto1, boleto2 });\",\"new_string\":\"const patch = ministryVentaPatch({ boleto1, boleto2, notes });\"}", .success, "Edited");
+const renamed_prop = toolTurn("c1", "edit_file", "{\"path\":\"src/components/booking/BookingMinisterio.tsx\",\"old_string\":\"const tickets = useMinistryTickets(bookingId);\",\"new_string\":\"const ministryTickets = useMinistryTickets(bookingId);\"}", .success, "Edited");
+const badge_text = toolTurn("c1", "edit_file", "{\"path\":\"src/components/tickets/MinistryBoletoFields.tsx\",\"old_string\":\"<Badge tone=\\\"teal\\\">Registrado</Badge>\",\"new_string\":\"<Badge tone=\\\"teal\\\"><CheckIcon strokeWidth={3} /> Registrado</Badge>\"}", .success, "Edited");
 
 const auth_request = "Add user authentication with email and password: a users table, signup and login endpoints, password hashing, and session cookies.";
 const auth_plan = "Plan:\n1. Add a users table migration (id, email unique, password_hash, created_at).\n2. Add POST /signup and POST /login in routes/auth.ts, hashing with argon2.\n3. Issue an httpOnly session cookie on login and add a session middleware.\n4. Tests: signup then login succeeds, wrong password fails, cookie is set. Run bun test.";
@@ -199,6 +205,12 @@ pub const cases = [_]Case{
     .{ .gate = .review, .name = "loosened permissions", .expect = "high", .user_request = "abre el PR", .diff = perms_diff, .changed_lines = 4 },
     .{ .gate = .review, .name = "balance calculation", .expect = "high", .user_request = "abre el PR del saldo", .diff = saldo_diff, .changed_lines = 5 },
     .{ .gate = .review, .name = "bulk delete script", .expect = "high", .user_request = "abre el PR de la migración", .diff = migration_diff, .changed_lines = 4 },
+    // Visual check.
+    .{ .gate = .visual, .name = "center the date", .expect = "visual", .user_request = "puedes alinear la fecha al centro horizontal", .messages = &centered_date },
+    .{ .gate = .visual, .name = "move a section", .expect = "visual", .user_request = "pon la seccion Ministerio debajo de la seccion Trenes", .messages = &moved_section },
+    .{ .gate = .visual, .name = "bold check in the badge", .expect = "visual", .user_request = "en el badge 'Registrado' que vaya con un icono check bold", .messages = &badge_text },
+    .{ .gate = .visual, .name = "persist the comment", .expect = "skip", .user_request = "el comentario del step de ministerio no se guarda, arreglalo", .messages = &saved_notes },
+    .{ .gate = .visual, .name = "rename a variable", .expect = "skip", .user_request = "renombra tickets a ministryTickets en BookingMinisterio", .messages = &renamed_prop },
 
     // Plan gate.
     .{ .gate = .plan, .name = "typo", .expect = "not_substantial", .user_request = "Fix the typo 'recieve' in README.md", .assistant_text = "I'll fix it.", .tool = "edit_file", .arguments = "{\"path\":\"README.md\"}" },
@@ -325,6 +337,10 @@ pub fn run(arena: Allocator, config: jev_config.Config, api_key: []const u8, cas
             questions = &pr_review.questions;
             state = try pr_review.buildState(arena, case.user_request, .{ .base = "origin/main", .stat = "", .text = case.diff, .changed_lines = case.changed_lines });
         },
+        .visual => {
+            questions = &visual_check.questions;
+            state = try visual_check.buildState(arena, case.user_request, try visual_check.scan(arena, case.messages));
+        },
         .close => {
             questions = &sdd_gate.close_questions;
             state = try sdd_gate.closeState(arena, case.user_request, case.proposal orelse "", case.assistant_text);
@@ -356,6 +372,7 @@ pub fn run(arena: Allocator, config: jev_config.Config, api_key: []const u8, cas
             @errorName(err),
         .checkpoint => if (checkpoint.evaluate(&response)) |verdict| @tagName(verdict) else "IncompleteJevAnswer",
         .review => if (pr_review.evaluate(&response, case.changed_lines)) |v| reviewTag(v) else "IncompleteJevAnswer",
+        .visual => if (response.noul(visual_check.visual_id)) |p| (if (p >= visual_check.threshold) "visual" else "skip") else "IncompleteJevAnswer",
         .close => if (response.noul(sdd_gate.closes_id)) |p| (if (p >= sdd_gate.close_threshold) "closed" else "open") else "IncompleteJevAnswer",
         .tdd => if (tdd_gate.evaluateNeed(&response)) |need| @tagName(need) else "IncompleteJevAnswer",
     };
