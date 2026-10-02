@@ -122,6 +122,7 @@ With no provider selected, fx picks the first preset whose key variable is set.
 | `zai`, `zhipu` | `ZAI_API_KEY`, `ZHIPUAI_API_KEY` | GLM (Z.ai / BigModel) |
 | `minimax` | `MINIMAX_API_KEY` | api.minimax.io |
 | `muse` | `MUSE_API_KEY` | Meta Model API, api.meta.ai (`muse-spark-1.3`, `muse-spark-1.3-contributor`; works with a Muse Code plan key; verified end to end) |
+| `stepfun` | `STEPFUN_API_KEY` | api.stepfun.ai (`step-5-preview`, `step-3.7-flash`, `step-3.5-flash`, `step-3.5-flash-2603`; verified end to end) |
 | `openrouter` | `OPENROUTER_API_KEY` | openrouter.ai |
 | `openai`, `anthropic`, `gemini`, `xai`, `mistral` | `<NAME>_API_KEY` | vendor OpenAI-compatible endpoints |
 | `groq`, `together`, `fireworks`, `siliconflow` | `<NAME>_API_KEY` | vendor OpenAI-compatible endpoints |

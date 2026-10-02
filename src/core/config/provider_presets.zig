@@ -110,6 +110,17 @@ pub const definitions = [_]Definition{
             .{ .id = "muse-spark-1.3-contributor", .context_window = 1_048_576, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &muse_efforts },
         },
     }),
+    // StepFun accepts reasoning_effort but silently ignores `none`, so only
+    // low through high are offered. tool_choice is accepted, not enforced.
+    preset("stepfun", "https://api.stepfun.ai/v1", "STEPFUN_API_KEY", .{
+        .default_model = "step-5-preview",
+        .models = &.{
+            .{ .id = "step-5-preview", .context_window = 1_024_000, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &low_medium_high },
+            .{ .id = "step-3.7-flash", .context_window = 262_144, .supports_tool_use = true, .supports_vision = true, .reasoning_efforts = &low_medium_high },
+            .{ .id = "step-3.5-flash", .context_window = 262_144, .supports_tool_use = true, .reasoning_efforts = &low_medium_high },
+            .{ .id = "step-3.5-flash-2603", .context_window = 262_144, .supports_tool_use = true, .reasoning_efforts = &low_medium_high },
+        },
+    }),
     preset("openrouter", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", .{
         .reasoning_format = .openrouter,
     }),
@@ -166,6 +177,8 @@ test "provider presets are valid connection definitions" {
     try std.testing.expectEqualStrings("DEEPSEEK_API_KEY", get("deepseek").?.auth.bearer);
     try std.testing.expectEqualStrings("MUSE_API_KEY", get("muse").?.auth.bearer);
     try std.testing.expectEqualStrings("muse-spark-1.3", get("muse").?.default_model.?);
+    try std.testing.expectEqualStrings("STEPFUN_API_KEY", get("stepfun").?.auth.bearer);
+    try std.testing.expectEqualStrings("step-5-preview", get("stepfun").?.default_model.?);
     try std.testing.expect(get("ollama").?.auth == .none);
     try std.testing.expect(get("missing") == null);
 }

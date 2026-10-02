@@ -1059,7 +1059,8 @@ pub const Reducer = struct {
         for (value.array.items) |item| {
             if (item != .object) continue;
             const delta = item.object;
-            if (non_null(delta, "type")) |kind| if (kind != .string or !std.mem.eql(u8, kind.string, "function")) continue;
+            // Continuation deltas may repeat every field as an empty string.
+            if (non_null(delta, "type")) |kind| if (kind != .string or (kind.string.len != 0 and !std.mem.eql(u8, kind.string, "function"))) continue;
             const id: ?[]const u8 = if (non_null(delta, "id")) |text| (if (text == .string and text.string.len != 0) text.string else null) else null;
             const index: ?usize = if (non_null(delta, "index")) |number| (index_value(number) catch null) else null;
             const slot = try self.resolve_tool_slot(id, index);
@@ -2999,6 +3000,22 @@ test "lenient chat completions routes unindexed deltas and repeated names" {
     try std.testing.expectEqualStrings("c1", calls[0].id);
     try std.testing.expectEqualStrings("shell", calls[0].name);
     try std.testing.expectEqualStrings("{\"request\":{\"command\":\"ls\"}}", calls[0].arguments_json);
+}
+
+test "lenient chat completions continues calls whose deltas repeat empty fields" {
+    const alloc = std.testing.allocator;
+    var result = try test_lenient_result(&.{
+        "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\"}}]}}]}",
+        "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"\",\"type\":\"\",\"function\":{\"name\":\"\",\"arguments\":\"\\\"path\\\": \\\"x\\\"}\"}}]}}]}",
+        test_tools_finish,
+        "[DONE]",
+    });
+    defer result.deinit(alloc);
+    const calls = result.completed.completion.tool_calls;
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualStrings("c1", calls[0].id);
+    try std.testing.expectEqualStrings("read_file", calls[0].name);
+    try std.testing.expectEqualStrings("{\"path\": \"x\"}", calls[0].arguments_json);
 }
 
 test "lenient chat completions synthesizes missing ids and empty arguments" {
