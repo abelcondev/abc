@@ -46,6 +46,7 @@ const receipts = @import("receipts.zig");
 const checkpoint = @import("checkpoint.zig");
 const pr_review = @import("pr_review.zig");
 const visual_check = @import("visual_check.zig");
+const scripted_edit = @import("scripted_edit.zig");
 const turn_text = @import("turn_text.zig");
 
 const Allocator = std.mem.Allocator;
@@ -64,6 +65,8 @@ pub const Gate = struct {
     plan_settled: bool = false,
     plan_holds: u8 = 0,
     action_holds: u8 = 0,
+    /// A scripted edit was already held this turn.
+    edit_held: bool = false,
     /// SDD mode for this turn's workspace, loaded on the first file change.
     sdd_turn_mode: ?sdd_mode.Mode = null,
     /// The route this turn's work goes through once code may change; null
@@ -367,6 +370,7 @@ pub const Gate = struct {
         self.plan_settled = false;
         self.plan_holds = 0;
         self.action_holds = 0;
+        self.edit_held = false;
         self.sdd_turn_mode = null;
         self.sdd_route = null;
         self.clearTouched();
@@ -488,6 +492,13 @@ pub const Gate = struct {
                 };
                 if (review_action != .continue_) break :blk review_action;
             }
+            if (config.edits_gate and !self.edit_held and std.mem.eql(u8, tool, "shell")) {
+                const edit_action = self.checkScriptedEdit(input) catch |err| edit: {
+                    debug_trace.logf("jev", "edits gate failed err={s}", .{@errorName(err)});
+                    break :edit hooks.PreToolUseAction.continue_;
+                };
+                if (edit_action != .continue_) break :blk edit_action;
+            }
             if (config.sdd_gate and plan_gate.isFileChange(tool)) {
                 if (!self.sdd_settled) {
                     const sdd_action = self.checkSdd(input) catch |err| sdd: {
@@ -553,6 +564,33 @@ pub const Gate = struct {
         decision_log.append(self.alloc, entry);
         if (!verdict.due) return .continue_;
         return .{ .block = self.lend(try pr_review.holdReason(self.alloc, verdict, diff)) };
+    }
+    /// Holds a targeted in-place shell edit once per turn so the agent uses
+    /// `edit_file` instead.
+    fn checkScriptedEdit(self: *Gate, input: hooks.PreToolUseInput) !hooks.PreToolUseAction {
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const command = argString(arena_state.allocator(), input.arguments_json, "command") orelse return .continue_;
+        if (!scripted_edit.isScriptedEdit(command)) return .continue_;
+        var entry = self.newEntry("edits", input.invocation, scripted_edit.threshold);
+        const state = try scripted_edit.buildState(self.alloc, input.user_request, command);
+        defer self.alloc.free(state);
+        var response = self.consult(&entry, state, &scripted_edit.questions) orelse return .continue_;
+        defer response.deinit();
+        const p = response.noul(scripted_edit.targeted_id) orelse {
+            self.logIncomplete(&entry, error.IncompleteJevAnswer);
+            return .continue_;
+        };
+        if (p < scripted_edit.threshold) {
+            entry.outcome = "skip";
+            entry.detail = "mechanical change";
+            decision_log.append(self.alloc, entry);
+            return .continue_;
+        }
+        self.edit_held = true;
+        entry.outcome = "hold";
+        decision_log.append(self.alloc, entry);
+        return .{ .block = scripted_edit.hold_reason };
     }
 
     fn checkAsk(self: *Gate, input: hooks.PreToolUseInput) !hooks.PreToolUseAction {
