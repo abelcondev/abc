@@ -43,7 +43,7 @@ const sdd_mode = @import("../sdd/sdd_mode.zig");
 const sdd_layout = @import("../sdd/sdd_layout.zig");
 const sdd_gate = @import("sdd_gate.zig");
 const tdd_gate = @import("tdd_gate.zig");
-const pr_review = @import("pr_review.zig");
+const claim_check = @import("claim_check.zig");
 const visual_check = @import("visual_check.zig");
 const scripted_edit = @import("scripted_edit.zig");
 const memory_gate = @import("memory_gate.zig");
@@ -107,8 +107,6 @@ pub const Gate = struct {
     /// This turn already compared the statuses against `sdd_seen` and
     /// checked whether the user's message closes a finished change.
     sdd_turn_started: bool = false,
-    /// Branches the review gate already held a pull request for. Owned keys.
-    reviewed_branches: std.StringHashMapUnmanaged(void) = .empty,
     /// Decision files already flagged by the drift check. Owned keys.
     drift_reported: std.StringHashMapUnmanaged(void) = .empty,
 
@@ -140,16 +138,13 @@ pub const Gate = struct {
         var reported = self.drift_reported.keyIterator();
         while (reported.next()) |key| self.alloc.free(key.*);
         self.drift_reported.deinit(self.alloc);
-        var reviewed = self.reviewed_branches.keyIterator();
-        while (reviewed.next()) |key| self.alloc.free(key.*);
-        self.reviewed_branches.deinit(self.alloc);
         self.config.deinit(self.alloc);
         self.* = undefined;
     }
 
     /// Whether handlers were registered for this runtime.
     pub fn registered(self: *const Gate) bool {
-        return self.config.enabled and (self.config.usesPreToolUse() or self.config.usesStop());
+        return self.config.enabled;
     }
 
     /// Turns registered handlers on or off for the rest of the process.
@@ -171,13 +166,13 @@ pub const Gate = struct {
                 .run = preToolUseHandler,
             });
         }
-        if (self.config.usesStop()) {
-            try runtime.registerStop(.{
-                .name = "fx.jev.after_turn",
-                .ctx = self,
-                .run = stopHandler,
-            });
-        }
+        // Iris can be on for a workspace while the profile gate is off,
+        // so the after-turn handler is always registered.
+        try runtime.registerStop(.{
+            .name = "fx.jev.after_turn",
+            .ctx = self,
+            .run = stopHandler,
+        });
     }
 
     fn clearSeen(self: *Gate) void {
@@ -457,13 +452,6 @@ pub const Gate = struct {
             if (config.sdd_gate and std.mem.eql(u8, tool, "shell")) {
                 if (self.checkStatusCommand(input)) |held| break :blk held;
             }
-            if (config.review_gate and std.mem.eql(u8, tool, "shell")) {
-                const review_action = self.checkPrReview(input) catch |err| review: {
-                    debug_trace.logf("jev", "review gate failed err={s}", .{@errorName(err)});
-                    break :review hooks.PreToolUseAction.continue_;
-                };
-                if (review_action != .continue_) break :blk review_action;
-            }
             if (config.edits_gate and !self.edit_held and std.mem.eql(u8, tool, "shell")) {
                 const edit_action = self.checkScriptedEdit(input) catch |err| edit: {
                     debug_trace.logf("jev", "edits gate failed err={s}", .{@errorName(err)});
@@ -513,37 +501,6 @@ pub const Gate = struct {
         };
     }
 
-    /// Holds the first pull request command per branch when Jev rates the
-    /// branch's diff as needing a review.
-    fn checkPrReview(self: *Gate, input: hooks.PreToolUseInput) !hooks.PreToolUseAction {
-        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-        const command = argString(arena, input.arguments_json, "command") orelse return .continue_;
-        if (!pr_review.isPrCommand(command)) return .continue_;
-        const root_path = input.invocation.scope.workspace_root;
-        const branch = pr_review.currentBranch(arena, root_path) orelse return .continue_;
-        if (self.reviewed_branches.contains(branch)) return .continue_;
-        const owned = try self.alloc.dupe(u8, branch);
-        errdefer self.alloc.free(owned);
-        try self.reviewed_branches.put(self.alloc, owned, {});
-        const diff = pr_review.branchDiff(arena, root_path) orelse return .continue_;
-        if (diff.changed_lines == 0) return .continue_;
-        var entry = self.newEntry("review", input.invocation, pr_review.harm_threshold);
-        const state = try pr_review.buildState(self.alloc, input.user_request, diff);
-        defer self.alloc.free(state);
-        var response = self.consult(&entry, state, &pr_review.questions) orelse return .continue_;
-        defer response.deinit();
-        const verdict = pr_review.evaluate(&response, diff.changed_lines) orelse {
-            self.logIncomplete(&entry, error.IncompleteJevAnswer);
-            return .continue_;
-        };
-        entry.outcome = if (verdict.due) "hold" else "skip";
-        entry.detail = @tagName(verdict.risk);
-        decision_log.append(self.alloc, entry);
-        if (!verdict.due) return .continue_;
-        return .{ .block = self.lend(try pr_review.holdReason(self.alloc, verdict, diff)) };
-    }
     /// Holds a targeted in-place shell edit once per turn so the agent uses
     /// `edit_file` instead.
     fn checkScriptedEdit(self: *Gate, input: hooks.PreToolUseInput) !hooks.PreToolUseAction {
@@ -1075,16 +1032,31 @@ pub const Gate = struct {
         if (self.config.drift_gate and changedFiles(input.turn_messages) and
             sdd_mode.load(self.alloc, input.invocation.scope.workspace_root).enabled)
         {
-            return self.checkDrift(input) catch |err| {
+            const drift_action = self.checkDrift(input) catch |err| drift_failed: {
                 debug_trace.logf("jev", "drift check failed err={s}", .{@errorName(err)});
-                return .allow;
+                break :drift_failed hooks.StopAction.allow;
             };
+            if (drift_action != .allow) return drift_action;
         }
-        return .allow;
+        return self.claimNote(input);
+    }
+
+    /// A user-only note when the answer claims passing tests that no run
+    /// after the last code change shows. Never sends the agent back.
+    fn claimNote(self: *Gate, input: hooks.StopInput) hooks.StopAction {
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const root_path = input.invocation.scope.workspace_root;
+        const configured = sdd_mode.load(self.alloc, root_path).testCommand();
+        const note = claim_check.check(arena_state.allocator(), input.assistant_text, input.turn_messages, root_path, configured) catch |err| {
+            debug_trace.logf("jev", "claim check failed err={s}", .{@errorName(err)});
+            return .allow;
+        };
+        return if (note) |text| .{ .note = text } else .allow;
     }
 
     fn visualAction(self: *Gate, input: hooks.StopInput) !?hooks.StopAction {
-        if (!self.config.visual_gate) return null;
+        if (!jev_config.irisEnabled(self.alloc, self.config, input.invocation.scope.workspace_root)) return null;
         return self.checkVisual(input) catch |err| {
             debug_trace.logf("jev", "visual check failed err={s}", .{@errorName(err)});
             return null;
@@ -1503,14 +1475,4 @@ test "changedFiles looks for successful file tool results" {
     try std.testing.expect(changedFiles(&edited));
     const failed = [_]types.ChatMessage{.{ .role = .tool, .tool_name = "write_file", .tool_result_status = .failure }};
     try std.testing.expect(!changedFiles(&failed));
-}
-
-test "a gate with no after-turn checks registers no stop handler" {
-    var runtime = hooks.Runtime.init(std.testing.allocator);
-    defer runtime.deinit();
-    var gate = Gate{ .alloc = std.testing.allocator, .config = .{ .enabled = true, .sdd_gate = false, .visual_gate = false, .drift_gate = false } };
-    defer gate.deinit();
-    try gate.register(&runtime);
-    const view = runtime.freeze();
-    try std.testing.expect(!view.hasStop());
 }

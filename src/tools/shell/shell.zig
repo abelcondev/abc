@@ -148,6 +148,13 @@ fn decode_input(
     if (raw.object.get("yield_time_ms") == null) {
         input.yield_time_ms = defaultYieldTime(action);
     }
+    if (action == .run) {
+        // The wait only sets how long fx watches before returning, so a
+        // longer one is clamped instead of costing the model a retry.
+        input.yield_time_ms = @min(input.yield_time_ms, managed_contract.max_yield_time_ms);
+        // `shell` applies only to a terminal; a plain run uses the default.
+        if (!input.tty and input.profile == null) input.shell = null;
+    }
     if (argument_problem(input) != null) return null;
     const owned = try ctx.allocator.create(OwnedInput);
     owned.* = .{
@@ -1888,7 +1895,6 @@ test "shell request correction suggests only unambiguous repairs without executi
         .{ .input = "{\"command\":\"true\",\"session_id\":\"shell-3\"}", .retry = null },
         .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"background\":true}", .retry = null },
         .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"profile\":\"clean\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/bash\"}}", .retry = null },
-        .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":30001}", .retry = null },
         .{ .input = "{\"request\":{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":\"1000\",\"timeout_ms\":0}}", .retry = null },
         .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":4294967296}", .retry = null },
         .{ .input = "{\"action\":\"stop\",\"session_id\":\"shell-3\",\"force\":\"true\"}", .retry = null },
@@ -2783,4 +2789,21 @@ test "shell delivery advances only after result commit" {
         replayed.snapshot.execution_id,
         replayed.reservation_id,
     );
+}
+
+test "shell run clamps a long wait and drops a shell without a terminal" {
+    const alloc = std.testing.allocator;
+    const decoded = try decode(.{ .allocator = alloc }, "{\"action\":\"run\",\"command\":\"ls\",\"yield_time_ms\":60000,\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/zsh\"},\"tty\":false}");
+    switch (decoded) {
+        .input => |input| {
+            defer input.deinit(alloc);
+            const owned: *OwnedInput = @ptrCast(@alignCast(input.ptr));
+            try std.testing.expectEqual(managed_contract.max_yield_time_ms, owned.value.yield_time_ms);
+            try std.testing.expect(owned.value.shell == null);
+        },
+        .failure => |failure| {
+            alloc.free(failure);
+            return error.TestUnexpectedResult;
+        },
+    }
 }

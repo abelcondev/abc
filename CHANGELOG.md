@@ -1,8 +1,30 @@
 # fx
 
-## 0.6.0
+## 0.7.0
 
 <!-- release:start -->
+
+**fx lite: Jev now only steps in where it saves time, so turns finish faster.**
+
+### Breaking Changes
+
+- **No more completion re-checks:** fx no longer sends the agent back after its answer to prove each claim. The "this turn's tool results do not back the answer yet" retry, the receipts file and the `jev.gates.stop` and `jev.thresholds.stop` settings are gone.
+- **No automatic checkpoint commits:** fx no longer commits earlier work before a separate request. `jev.gates.checkpoint` is gone; commit when you choose to.
+- **No pull request review gate:** `gh pr create` and `gh pr ready` run without a held review. `jev.gates.review` is gone.
+- **TDD is off by default:** New workspaces use `tdd: off`. Workspaces that saved a mode keep it; `fx sdd tdd auto` turns Jev's per-request choice back on.
+
+### New Features
+
+- **Jev modes:** `fx jev lite` (the default) keeps the checks that save a model round: answering settled questions, SDD routing, safer edits and memory. `fx jev full` adds the plan, drift and Iris checks. `/jev lite` and `/jev full` work inside a session, and `FX_JEV_MODE` overrides the saved mode.
+- **Iris per project:** `fx jev iris on|off` (or `/jev iris on|off`) turns the screenshot check on or off for the current workspace only.
+- **Unbacked test claims:** When the answer says the tests pass but no passing test run follows the last code change, fx shows one line under the answer. No model is called and the agent is not sent back.
+
+### Improvements
+
+- **Fewer failed shell calls:** Fields such as `timeout_ms` sent next to `request` instead of inside it now run instead of failing. A `yield_time_ms` above 30 seconds is capped, and a `shell` choice without a terminal falls back to the default shell. Each of these used to cost a model round.
+<!-- release:end -->
+
+## 0.6.0
 
 **Jev now decides more of the work: when a change needs a test first, when to commit, when a pull request needs a review, and what to remember.**
 
@@ -30,7 +52,6 @@
 ### Security
 
 - **Memory paths as data:** Workspace paths and memory index lines are encoded before they reach the model, so a crafted directory name cannot inject instructions.
-<!-- release:end -->
 
 ## 0.5.0
 

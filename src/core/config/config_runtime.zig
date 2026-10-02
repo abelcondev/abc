@@ -1096,6 +1096,15 @@ pub fn setWorkspaceTdd(
     return mutateWorkspaceSdd(alloc, .{ .workspace_root = workspace_root, .tdd = tdd });
 }
 
+/// Saves `workspaces["<workspace_root>"].iris` in the profile settings.
+pub fn setWorkspaceIris(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    enabled: bool,
+) !CommitOutcome {
+    return mutateWorkspaceSdd(alloc, .{ .workspace_root = workspace_root, .iris = enabled });
+}
+
 fn mutateWorkspaceSdd(alloc: Allocator, mutation: settings_store.WorkspaceSddMutation) !CommitOutcome {
     const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
     var store = try settings_store.Store.initFromHome(alloc, home, .writable);

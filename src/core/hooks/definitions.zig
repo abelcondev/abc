@@ -169,15 +169,19 @@ pub const StopInput = struct {
 pub const StopAction = union(enum) {
     allow,
     continue_once: []const u8,
+    /// Ends the turn and shows one line to the user; the model never sees it.
+    note: []const u8,
 };
 
 pub const StopOutcome = union(enum) {
     allow,
     continue_once: []u8,
+    note: []u8,
 
     pub fn deinit(self: *StopOutcome, alloc: std.mem.Allocator) void {
         switch (self.*) {
             .continue_once => |context| alloc.free(context),
+            .note => |text| alloc.free(text),
             .allow => {},
         }
         self.* = .allow;

@@ -1324,6 +1324,13 @@ fn project_read_tool_result_request_messages(
     return projected orelse source;
 }
 
+fn movable_terminal_field(name: []const u8) bool {
+    for ([_][]const u8{ "timeout_ms", "yield_time_ms", "cwd", "tty", "profile", "shell", "session_id", "chars" }) |known| {
+        if (std.mem.eql(u8, name, known)) return true;
+    }
+    return false;
+}
+
 fn normalized_terminal_request_arguments(
     alloc: Allocator,
     arguments_json: []const u8,
@@ -1333,9 +1340,19 @@ fn normalized_terminal_request_arguments(
         else => return null,
     };
     defer parsed.deinit();
-    if (parsed.value != .object or parsed.value.object.count() != 1) return null;
+    if (parsed.value != .object) return null;
     const request = parsed.value.object.getPtr("request") orelse return null;
     if (request.* != .object) return null;
+    // Models often put a field such as `timeout_ms` beside `request`. Move
+    // each one inside unless `request` already sets it, which stays an error
+    // for the tool to explain.
+    var outer = parsed.value.object.iterator();
+    while (outer.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "request")) continue;
+        if (!movable_terminal_field(entry.key_ptr.*)) return null;
+        if (request.object.contains(entry.key_ptr.*)) return null;
+        try request.object.put(parsed.arena.allocator(), entry.key_ptr.*, entry.value_ptr.*);
+    }
     _ = try normalize_terminal_model_input(
         parsed.arena.allocator(),
         &request.object,
@@ -1667,6 +1684,20 @@ test "terminal inferred model input round trips every atomic write payload" {
         defer alloc.free(normalized);
         try std.testing.expectEqualStrings(case.internal, normalized);
     }
+}
+
+test "terminal request normalization moves fields beside request inside it" {
+    const alloc = std.testing.allocator;
+    const moved = (try normalized_terminal_request_arguments(
+        alloc,
+        "{\"request\":{\"action\":\"run\",\"command\":\"bun test\"},\"timeout_ms\":300000}",
+    )).?;
+    defer alloc.free(moved);
+    try std.testing.expectEqualStrings("{\"action\":\"run\",\"command\":\"bun test\",\"timeout_ms\":300000}", moved);
+    try std.testing.expect((try normalized_terminal_request_arguments(
+        alloc,
+        "{\"request\":{\"action\":\"run\",\"command\":\"ls\",\"timeout_ms\":1},\"timeout_ms\":2}",
+    )) == null);
 }
 
 test "shell request projection wraps eligible flat objects without changing source messages" {
@@ -9548,6 +9579,30 @@ fn processQueuedPromptLoop(
                     );
                     return;
                 },
+                .note => |text| {
+                    stop_state.terminal_materializing = true;
+                    try deps.push_text(deps.ctx, .{ .operational = "\n" });
+                    try deps.push_text(deps.ctx, .{ .operational = text });
+                    try deps.push_text(deps.ctx, .{ .operational = "\n" });
+                    try finishCommonAssistantTerminal(
+                        deps,
+                        finalization,
+                        arena,
+                        job,
+                        within_turn_suffix.items,
+                        &summary_accumulator,
+                        .{ .history = "", .presentation = history_text },
+                        .completed,
+                        if (disposition == .length_limited)
+                            .length_limited
+                        else
+                            null,
+                        &finish_trace,
+                        "assistant",
+                        null,
+                    );
+                    return;
+                },
                 .continue_once => |context| {
                     try deps.push_text(deps.ctx, .{ .operational = "\n" ++ hooks.prompt.continuation_marker });
                     try deps.push_text(deps.ctx, .{ .operational = hooks.prompt.continuationNotice(context) });
@@ -12319,6 +12374,27 @@ fn processQueuedPromptLoop(
             switch (stop_outcome) {
                 .allow => {
                     stop_state.terminal_materializing = true;
+                    try finishCommonAssistantTerminal(
+                        deps,
+                        finalization,
+                        arena,
+                        job,
+                        within_turn_suffix.items,
+                        &summary_accumulator,
+                        .{ .history = "", .presentation = retained_final },
+                        .completed,
+                        null,
+                        &finish_trace,
+                        "assistant",
+                        null,
+                    );
+                    return;
+                },
+                .note => |text| {
+                    stop_state.terminal_materializing = true;
+                    try deps.push_text(deps.ctx, .{ .operational = "\n" });
+                    try deps.push_text(deps.ctx, .{ .operational = text });
+                    try deps.push_text(deps.ctx, .{ .operational = "\n" });
                     try finishCommonAssistantTerminal(
                         deps,
                         finalization,

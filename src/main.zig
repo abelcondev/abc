@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
 
-pub const version = "0.6.0";
+pub const version = "0.7.0";
 
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");
@@ -4398,7 +4398,7 @@ test {
     _ = @import("core/sdd/sdd_layout.zig");
     _ = @import("core/decisions/sdd_gate.zig");
     _ = @import("core/decisions/tdd_gate.zig");
-    _ = @import("core/decisions/pr_review.zig");
+    _ = @import("core/decisions/claim_check.zig");
     _ = @import("core/decisions/visual_check.zig");
     _ = @import("core/decisions/scripted_edit.zig");
     _ = @import("core/memory/memory_store.zig");

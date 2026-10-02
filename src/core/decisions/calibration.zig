@@ -17,7 +17,6 @@ const routing = @import("routing.zig");
 const sdd_gate = @import("sdd_gate.zig");
 const tdd_gate = @import("tdd_gate.zig");
 const sdd_layout = @import("../sdd/sdd_layout.zig");
-const pr_review = @import("pr_review.zig");
 const visual_check = @import("visual_check.zig");
 const drift = @import("drift.zig");
 const scripted_edit = @import("scripted_edit.zig");
@@ -26,7 +25,7 @@ const memory_gate = @import("memory_gate.zig");
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
 
-pub const Gate = enum { plan, action, ask, routing, sdd, close, tdd, review, visual, drift, edits, memory };
+pub const Gate = enum { plan, action, ask, routing, sdd, close, tdd, visual, drift, edits, memory };
 
 const Case = struct {
     gate: Gate,
@@ -43,10 +42,8 @@ const Case = struct {
     rules: []const sdd_layout.Rule = &.{},
     /// SDD change waiting for approval, or the finished change to close.
     proposal: ?[]const u8 = null,
-    /// Branch diff and its changed lines (review cases), or the diff checked
-    /// against `rules[0]` (drift cases).
+    /// The diff checked against `rules[0]` (drift cases).
     diff: []const u8 = "",
-    changed_lines: usize = 0,
 };
 
 fn toolTurn(comptime id: []const u8, comptime tool: []const u8, comptime args: []const u8, comptime status: types.PersistedToolStatus, comptime output: []const u8) [2]ChatMessage {
@@ -56,66 +53,6 @@ fn toolTurn(comptime id: []const u8, comptime tool: []const u8, comptime args: [
     };
 }
 
-const readme_diff =
-    \\--- a/README.md
-    \\+++ b/README.md
-    \\@@ -10,3 +10,3 @@
-    \\-Instala con `bun i` y corre `bun dev`.
-    \\+Instala con `bun install` y corre `bun run dev`.
-;
-const card_diff =
-    \\--- a/src/components/tickets/MinistryBoletoFields.tsx
-    \\+++ b/src/components/tickets/MinistryBoletoFields.tsx
-    \\@@ -36,9 +36,9 @@
-    \\-      <div className="flex flex-wrap items-center gap-3">
-    \\+      <div className="flex min-w-0 items-center gap-3">
-    \\-        <Badge tone="teal">Registrado</Badge>
-    \\+        <Badge tone="teal"><CheckIcon width={13} height={13} strokeWidth={3} /> Registrado</Badge>
-    \\-      <div className="border-t pt-2">{labels.map((l) => <Badge key={l}>{l}</Badge>)}</div>
-    \\+      <p className="text-xs uppercase text-muted">Venta</p>
-    \\+      <div className="rounded-inner bg-surface-2 p-3">{labels.map((l) => <p key={l}>{l}</p>)}</div>
-;
-const perms_diff =
-    \\--- a/instant.perms.ts
-    \\+++ b/instant.perms.ts
-    \\@@ -40,8 +40,8 @@
-    \\   ministryTickets: {
-    \\     allow: {
-    \\-      update: "auth.id != null && isReservas",
-    \\-      delete: "auth.id != null && isAdmin",
-    \\+      update: "auth.id != null",
-    \\+      delete: "auth.id != null",
-    \\     },
-;
-const saldo_diff =
-    \\--- a/src/lib/payments.ts
-    \\+++ b/src/lib/payments.ts
-    \\@@ -12,6 +12,9 @@
-    \\ export function saldo(booking: Booking): number {
-    \\-  return booking.amount;
-    \\+  const paid = booking.payments
-    \\+    .filter((p) => !p.deletedAt)
-    \\+    .reduce((sum, p) => sum + p.amount, 0);
-    \\+  return booking.amount - paid;
-    \\ }
-;
-const migration_diff =
-    \\--- /dev/null
-    \\+++ b/scripts/migrate-ministry.ts
-    \\@@ -0,0 +1,9 @@
-    \\+// One boleto per booking: delete the old per-passenger rows.
-    \\+const rows = await db.query({ ministryTickets: {} });
-    \\+await db.transact(rows.ministryTickets.map((t) => tx.ministryTickets[t.id].delete()));
-    \\+console.log(`deleted ${rows.ministryTickets.length} rows`);
-;
-const filter_diff =
-    \\--- a/src/lib/bookings.ts
-    \\+++ b/src/lib/bookings.ts
-    \\@@ -80,4 +80,12 @@
-    \\+export function filterByTravelDate(bookings: BookingLite[], from?: string, to?: string) {
-    \\+  return bookings.filter((b) => (!from || b.startDate >= from) && (!to || b.startDate <= to));
-    \\+}
-;
 const centered_date = toolTurn("c1", "edit_file", "{\"path\":\"src/components/tickets/MinistryBoletoFields.tsx\",\"old_string\":\"<div className=\\\"flex flex-wrap items-center gap-3\\\">\",\"new_string\":\"<div className=\\\"flex items-center\\\"><div className=\\\"min-w-0 flex-1 text-center\\\">\"}", .success, "Edited");
 const moved_section = toolTurn("c1", "edit_file", "{\"path\":\"src/components/booking/BookingDetail.tsx\",\"old_string\":\"<BookingTrenes bookingId={bookingId} />\",\"new_string\":\"<BookingTrenes bookingId={bookingId} />\\n<BookingMinisterio bookingId={bookingId} />\"}", .success, "Edited");
 const saved_notes = toolTurn("c1", "edit_file", "{\"path\":\"src/components/booking/CreateBookingSheet.tsx\",\"old_string\":\"const patch = ministryVentaPatch({ boleto1, boleto2 });\",\"new_string\":\"const patch = ministryVentaPatch({ boleto1, boleto2, notes });\"}", .success, "Edited");
@@ -172,13 +109,6 @@ const review_request = "Implemented and verified: bun test 284 pass, build OK. I
 const pagos_proposal = "# Pagos parciales\n\n## Why\nAgencies collect in installments.\n\n## What\n- New payment_plans table with installments per booking\n- A Plan de pagos panel in the booking detail\n\n## Tasks\n- [ ] Schema\n- [ ] Panel";
 
 pub const cases = [_]Case{
-    // Pull request review.
-    .{ .gate = .review, .name = "readme wording", .expect = "low", .user_request = "abre el PR", .diff = readme_diff, .changed_lines = 2 },
-    .{ .gate = .review, .name = "card styling", .expect = "low", .user_request = "abre el PR con los cambios del card", .diff = card_diff, .changed_lines = 120 },
-    .{ .gate = .review, .name = "large date filter", .expect = "medium+due", .user_request = "abre el PR del filtro por fecha", .diff = filter_diff, .changed_lines = 520 },
-    .{ .gate = .review, .name = "loosened permissions", .expect = "high", .user_request = "abre el PR", .diff = perms_diff, .changed_lines = 4 },
-    .{ .gate = .review, .name = "balance calculation", .expect = "high", .user_request = "abre el PR del saldo", .diff = saldo_diff, .changed_lines = 5 },
-    .{ .gate = .review, .name = "bulk delete script", .expect = "high", .user_request = "abre el PR de la migración", .diff = migration_diff, .changed_lines = 4 },
     // Visual check.
     .{ .gate = .visual, .name = "center the date", .expect = "visual", .user_request = "puedes alinear la fecha al centro horizontal", .messages = &centered_date },
     .{ .gate = .visual, .name = "move a section", .expect = "visual", .user_request = "pon la seccion Ministerio debajo de la seccion Trenes", .messages = &moved_section },
@@ -321,10 +251,6 @@ pub fn run(arena: Allocator, config: jev_config.Config, api_key: []const u8, cas
             questions = try sdd_gate.questions(arena, case.rules.len, case.proposal != null);
             state = try sdd_gate.buildState(arena, sddInput(case));
         },
-        .review => {
-            questions = &pr_review.questions;
-            state = try pr_review.buildState(arena, case.user_request, .{ .base = "origin/main", .stat = "", .text = case.diff, .changed_lines = case.changed_lines });
-        },
         .visual => {
             questions = &visual_check.questions;
             state = try visual_check.buildState(arena, case.user_request, try visual_check.scan(arena, case.messages));
@@ -372,7 +298,6 @@ pub fn run(arena: Allocator, config: jev_config.Config, api_key: []const u8, cas
             (if (v.approves) "approved" else if (v.bug and v.route == .fix) "fix+bug" else @tagName(v.route))
         else |err|
             @errorName(err),
-        .review => if (pr_review.evaluate(&response, case.changed_lines)) |v| reviewTag(v) else "IncompleteJevAnswer",
         .visual => if (response.noul(visual_check.visual_id)) |p| (if (p >= visual_check.threshold) "visual" else "skip") else "IncompleteJevAnswer",
         .drift => if (drift.contradiction(&response, 0)) |p|
             (if (p < drift.contradiction_threshold) "no_contradiction" else @tagName(drift.Direction.of(drift.originFor(&response, 0))))
@@ -410,16 +335,6 @@ fn needInput(arena: Allocator, case: Case) !tdd_gate.NeedInput {
     const path = if (parsed == .object) (if (parsed.object.get("path")) |value| (if (value == .string) value.string else "") else "") else "";
     return .{ .user_request = case.user_request, .assistant_text = case.assistant_text, .path = path, .arguments_json = case.arguments };
 }
-/// `high` always holds; `low` never does; `medium` reports whether size
-/// made it due; a medium or low change that does not hold is `skip`.
-fn reviewTag(verdict: pr_review.Verdict) []const u8 {
-    return switch (verdict.risk) {
-        .high => "high",
-        .medium => if (verdict.due) "medium+due" else "skip",
-        .low => "low",
-    };
-}
-
 fn summarize(arena: Allocator, response: *const jev_contract.Response) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     for (response.answers, 0..) |named, index| {
