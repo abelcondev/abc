@@ -20,11 +20,12 @@ const tdd_gate = @import("tdd_gate.zig");
 const sdd_layout = @import("../sdd/sdd_layout.zig");
 const receipts = @import("receipts.zig");
 const checkpoint = @import("checkpoint.zig");
+const pr_review = @import("pr_review.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
 
-pub const Gate = enum { stop, plan, action, ask, routing, sdd, close, tdd, checkpoint };
+pub const Gate = enum { stop, plan, action, ask, routing, sdd, close, tdd, checkpoint, review };
 
 const Case = struct {
     gate: Gate,
@@ -46,6 +47,9 @@ const Case = struct {
     /// Requests and files behind the uncommitted work (checkpoint cases).
     previous: []const []const u8 = &.{},
     files: []const []const u8 = &card_paths,
+    /// Branch diff and its changed lines (review cases).
+    diff: []const u8 = "",
+    changed_lines: usize = 0,
 };
 
 fn toolTurn(comptime id: []const u8, comptime tool: []const u8, comptime args: []const u8, comptime status: types.PersistedToolStatus, comptime output: []const u8) [2]ChatMessage {
@@ -88,6 +92,66 @@ const card_requests = [_][]const u8{
 const wizard_requests = [_][]const u8{"en el step de ministerio en creacion de reserva agregar Comentarios, como lo tiene el step de Trenes"};
 const wizard_paths = [_][]const u8{ "src/components/booking/CreateBookingSheet.tsx", "src/lib/createBooking.ts", "tests/lib/createBooking.test.ts" };
 const card_paths = [_][]const u8{ "src/components/tickets/MinistryBoletoFields.tsx", "src/lib/ministryRegistry.ts", "tests/lib/ministryRegistry.test.ts" };
+const readme_diff =
+    \\--- a/README.md
+    \\+++ b/README.md
+    \\@@ -10,3 +10,3 @@
+    \\-Instala con `bun i` y corre `bun dev`.
+    \\+Instala con `bun install` y corre `bun run dev`.
+;
+const card_diff =
+    \\--- a/src/components/tickets/MinistryBoletoFields.tsx
+    \\+++ b/src/components/tickets/MinistryBoletoFields.tsx
+    \\@@ -36,9 +36,9 @@
+    \\-      <div className="flex flex-wrap items-center gap-3">
+    \\+      <div className="flex min-w-0 items-center gap-3">
+    \\-        <Badge tone="teal">Registrado</Badge>
+    \\+        <Badge tone="teal"><CheckIcon width={13} height={13} strokeWidth={3} /> Registrado</Badge>
+    \\-      <div className="border-t pt-2">{labels.map((l) => <Badge key={l}>{l}</Badge>)}</div>
+    \\+      <p className="text-xs uppercase text-muted">Venta</p>
+    \\+      <div className="rounded-inner bg-surface-2 p-3">{labels.map((l) => <p key={l}>{l}</p>)}</div>
+;
+const perms_diff =
+    \\--- a/instant.perms.ts
+    \\+++ b/instant.perms.ts
+    \\@@ -40,8 +40,8 @@
+    \\   ministryTickets: {
+    \\     allow: {
+    \\-      update: "auth.id != null && isReservas",
+    \\-      delete: "auth.id != null && isAdmin",
+    \\+      update: "auth.id != null",
+    \\+      delete: "auth.id != null",
+    \\     },
+;
+const saldo_diff =
+    \\--- a/src/lib/payments.ts
+    \\+++ b/src/lib/payments.ts
+    \\@@ -12,6 +12,9 @@
+    \\ export function saldo(booking: Booking): number {
+    \\-  return booking.amount;
+    \\+  const paid = booking.payments
+    \\+    .filter((p) => !p.deletedAt)
+    \\+    .reduce((sum, p) => sum + p.amount, 0);
+    \\+  return booking.amount - paid;
+    \\ }
+;
+const migration_diff =
+    \\--- /dev/null
+    \\+++ b/scripts/migrate-ministry.ts
+    \\@@ -0,0 +1,9 @@
+    \\+// One boleto per booking: delete the old per-passenger rows.
+    \\+const rows = await db.query({ ministryTickets: {} });
+    \\+await db.transact(rows.ministryTickets.map((t) => tx.ministryTickets[t.id].delete()));
+    \\+console.log(`deleted ${rows.ministryTickets.length} rows`);
+;
+const filter_diff =
+    \\--- a/src/lib/bookings.ts
+    \\+++ b/src/lib/bookings.ts
+    \\@@ -80,4 +80,12 @@
+    \\+export function filterByTravelDate(bookings: BookingLite[], from?: string, to?: string) {
+    \\+  return bookings.filter((b) => (!from || b.startDate >= from) && (!to || b.startDate <= to));
+    \\+}
+;
 
 const auth_request = "Add user authentication with email and password: a users table, signup and login endpoints, password hashing, and session cookies.";
 const auth_plan = "Plan:\n1. Add a users table migration (id, email unique, password_hash, created_at).\n2. Add POST /signup and POST /login in routes/auth.ts, hashing with argon2.\n3. Issue an httpOnly session cookie on login and add a session middleware.\n4. Tests: signup then login succeeds, wrong password fails, cookie is set. Run bun test.";
@@ -128,6 +192,13 @@ pub const cases = [_]Case{
     .{ .gate = .checkpoint, .name = "date filter in the reservas list", .expect = "commit", .user_request = "ahora agregá un filtro por fecha de viaje en la lista de reservas", .previous = &card_requests },
     .{ .gate = .checkpoint, .name = "unrelated login bug", .expect = "commit", .user_request = "el login con Google devuelve error 500 desde ayer, identifica el problema y arreglalo", .previous = &wizard_requests, .files = &wizard_paths },
     .{ .gate = .checkpoint, .name = "export to CSV", .expect = "commit", .user_request = "agregá un boton para exportar las reservas a CSV desde /reservas", .previous = &wizard_requests, .files = &wizard_paths },
+    // Pull request review.
+    .{ .gate = .review, .name = "readme wording", .expect = "low", .user_request = "abre el PR", .diff = readme_diff, .changed_lines = 2 },
+    .{ .gate = .review, .name = "card styling", .expect = "low", .user_request = "abre el PR con los cambios del card", .diff = card_diff, .changed_lines = 120 },
+    .{ .gate = .review, .name = "large date filter", .expect = "medium+due", .user_request = "abre el PR del filtro por fecha", .diff = filter_diff, .changed_lines = 520 },
+    .{ .gate = .review, .name = "loosened permissions", .expect = "high", .user_request = "abre el PR", .diff = perms_diff, .changed_lines = 4 },
+    .{ .gate = .review, .name = "balance calculation", .expect = "high", .user_request = "abre el PR del saldo", .diff = saldo_diff, .changed_lines = 5 },
+    .{ .gate = .review, .name = "bulk delete script", .expect = "high", .user_request = "abre el PR de la migración", .diff = migration_diff, .changed_lines = 4 },
 
     // Plan gate.
     .{ .gate = .plan, .name = "typo", .expect = "not_substantial", .user_request = "Fix the typo 'recieve' in README.md", .assistant_text = "I'll fix it.", .tool = "edit_file", .arguments = "{\"path\":\"README.md\"}" },
@@ -250,6 +321,10 @@ pub fn run(arena: Allocator, config: jev_config.Config, api_key: []const u8, cas
             questions = &checkpoint.questions;
             state = try checkpoint.buildState(arena, case.previous, case.user_request, case.files);
         },
+        .review => {
+            questions = &pr_review.questions;
+            state = try pr_review.buildState(arena, case.user_request, .{ .base = "origin/main", .stat = "", .text = case.diff, .changed_lines = case.changed_lines });
+        },
         .close => {
             questions = &sdd_gate.close_questions;
             state = try sdd_gate.closeState(arena, case.user_request, case.proposal orelse "", case.assistant_text);
@@ -280,6 +355,7 @@ pub fn run(arena: Allocator, config: jev_config.Config, api_key: []const u8, cas
         else |err|
             @errorName(err),
         .checkpoint => if (checkpoint.evaluate(&response)) |verdict| @tagName(verdict) else "IncompleteJevAnswer",
+        .review => if (pr_review.evaluate(&response, case.changed_lines)) |v| reviewTag(v) else "IncompleteJevAnswer",
         .close => if (response.noul(sdd_gate.closes_id)) |p| (if (p >= sdd_gate.close_threshold) "closed" else "open") else "IncompleteJevAnswer",
         .tdd => if (tdd_gate.evaluateNeed(&response)) |need| @tagName(need) else "IncompleteJevAnswer",
     };
@@ -309,6 +385,15 @@ fn needInput(arena: Allocator, case: Case) !tdd_gate.NeedInput {
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, case.arguments, .{});
     const path = if (parsed == .object) (if (parsed.object.get("path")) |value| (if (value == .string) value.string else "") else "") else "";
     return .{ .user_request = case.user_request, .assistant_text = case.assistant_text, .path = path, .arguments_json = case.arguments };
+}
+/// `high` always holds; `low` never does; `medium` reports whether size
+/// made it due; a medium or low change that does not hold is `skip`.
+fn reviewTag(verdict: pr_review.Verdict) []const u8 {
+    return switch (verdict.risk) {
+        .high => "high",
+        .medium => if (verdict.due) "medium+due" else "skip",
+        .low => "low",
+    };
 }
 
 fn summarize(arena: Allocator, response: *const jev_contract.Response) ![]const u8 {

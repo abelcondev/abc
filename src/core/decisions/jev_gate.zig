@@ -44,6 +44,7 @@ const sdd_gate = @import("sdd_gate.zig");
 const tdd_gate = @import("tdd_gate.zig");
 const receipts = @import("receipts.zig");
 const checkpoint = @import("checkpoint.zig");
+const pr_review = @import("pr_review.zig");
 const turn_text = @import("turn_text.zig");
 
 const Allocator = std.mem.Allocator;
@@ -104,6 +105,8 @@ pub const Gate = struct {
     checkpoint_settled: bool = false,
     /// Workspace fingerprint taken at this turn's last Stop. Owned.
     turn_fingerprint: ?[]u8 = null,
+    /// Branches the review gate already held a pull request for. Owned keys.
+    reviewed_branches: std.StringHashMapUnmanaged(void) = .empty,
     /// Decision files already flagged by the drift check. Owned keys.
     drift_reported: std.StringHashMapUnmanaged(void) = .empty,
 
@@ -138,6 +141,9 @@ pub const Gate = struct {
         self.clearReceiptState();
         self.receipts_seen.deinit(self.alloc);
         self.work_seen.deinit(self.alloc);
+        var reviewed = self.reviewed_branches.keyIterator();
+        while (reviewed.next()) |key| self.alloc.free(key.*);
+        self.reviewed_branches.deinit(self.alloc);
         self.config.deinit(self.alloc);
         self.* = undefined;
     }
@@ -470,6 +476,13 @@ pub const Gate = struct {
                 };
                 if (checkpoint_action != .continue_) break :blk checkpoint_action;
             }
+            if (config.review_gate and std.mem.eql(u8, tool, "shell")) {
+                const review_action = self.checkPrReview(input) catch |err| review: {
+                    debug_trace.logf("jev", "review gate failed err={s}", .{@errorName(err)});
+                    break :review hooks.PreToolUseAction.continue_;
+                };
+                if (review_action != .continue_) break :blk review_action;
+            }
             if (config.sdd_gate and plan_gate.isFileChange(tool)) {
                 if (!self.sdd_settled) {
                     const sdd_action = self.checkSdd(input) catch |err| sdd: {
@@ -503,6 +516,38 @@ pub const Gate = struct {
             debug_trace.logf("jev", "pre-tool gate failed tool={s} err={s}", .{ tool, @errorName(err) });
             return .continue_;
         };
+    }
+
+    /// Holds the first pull request command per branch when Jev rates the
+    /// branch's diff as needing a review.
+    fn checkPrReview(self: *Gate, input: hooks.PreToolUseInput) !hooks.PreToolUseAction {
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const command = argString(arena, input.arguments_json, "command") orelse return .continue_;
+        if (!pr_review.isPrCommand(command)) return .continue_;
+        const root_path = input.invocation.scope.workspace_root;
+        const branch = pr_review.currentBranch(arena, root_path) orelse return .continue_;
+        if (self.reviewed_branches.contains(branch)) return .continue_;
+        const owned = try self.alloc.dupe(u8, branch);
+        errdefer self.alloc.free(owned);
+        try self.reviewed_branches.put(self.alloc, owned, {});
+        const diff = pr_review.branchDiff(arena, root_path) orelse return .continue_;
+        if (diff.changed_lines == 0) return .continue_;
+        var entry = self.newEntry("review", input.invocation, pr_review.harm_threshold);
+        const state = try pr_review.buildState(self.alloc, input.user_request, diff);
+        defer self.alloc.free(state);
+        var response = self.consult(&entry, state, &pr_review.questions) orelse return .continue_;
+        defer response.deinit();
+        const verdict = pr_review.evaluate(&response, diff.changed_lines) orelse {
+            self.logIncomplete(&entry, error.IncompleteJevAnswer);
+            return .continue_;
+        };
+        entry.outcome = if (verdict.due) "hold" else "skip";
+        entry.detail = @tagName(verdict.risk);
+        decision_log.append(self.alloc, entry);
+        if (!verdict.due) return .continue_;
+        return .{ .block = self.lend(try pr_review.holdReason(self.alloc, verdict, diff)) };
     }
 
     fn checkAsk(self: *Gate, input: hooks.PreToolUseInput) !hooks.PreToolUseAction {

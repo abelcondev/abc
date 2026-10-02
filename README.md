@@ -223,6 +223,7 @@ En palabras simples:
 | **Drift** | Specs y registros de decisiones desactualizados tras un cambio. Solo con SDD activo. | activo |
 | **Ruteo SDD** | Cambios grandes sin propuesta. Solo con SDD activo. | activo |
 | **Checkpoint** | Mezclar trabajos distintos en un solo commit. Cuando un pedido nuevo no es parte del trabajo sin commitear de turnos anteriores, el agente commitea primero ese trabajo (solo sus archivos, sin push). Solo fuera de la rama principal y con tests o build en verde sobre el código actual. | activo |
+| **Review** | Abrir un PR riesgoso sin revisarlo. Antes de `gh pr create` o `gh pr ready`, Jev califica el diff de la rama (bajo, medio o alto). Uno alto, o uno medio de 400 líneas o más, se frena una vez por rama para revisarlo, refutar cada hallazgo contra el código, arreglar los que quedan y listarlos en el PR. | activo |
 | **Action** | Borrar, sobrescribir, publicar o salir del proyecto sin que lo pidas. Suma ~0,5 s por llamada. | inactivo |
 | **Routing** | Usar un modelo caro para una tarea trivial de un subagente. | inactivo |
 
@@ -509,6 +510,7 @@ Dentro de `jev` en `~/.fx/settings.json`:
 | `gates.drift` | Marca registros de decisiones que el cambio contradice (por defecto `true`) |
 | `gates.sdd` | Con SDD activo, clasifica el primer cambio como fix, spec o change (por defecto `true`) |
 | `gates.checkpoint` | Commitea el trabajo verificado de turnos anteriores antes de empezar un trabajo distinto (por defecto `true`) |
+| `gates.review` | Pide una revisión antes de abrir un PR riesgoso o grande (por defecto `true`) |
 | `gates.action` | Revisa cambios de archivos y comandos de shell (por defecto `false`) |
 | `gates.stop` | Corre el chequeo de finalización (por defecto `true`) |
 | `thresholds.ask` | Confianza y respaldo mínimos para responder (por defecto `0.8`) |
@@ -529,7 +531,7 @@ archivo Markdown por decisión en `sdd/decisions`, `docs/decisions`, `docs/adr`
 o `decisions` (front matter `title`/`status`/`description` opcional). Cada
 registro se marca una vez por sesión.
 
-`fx jev eval [stop|plan|action|ask|routing|sdd|close|tdd|checkpoint]` corre casos etiquetados con las
+`fx jev eval [stop|plan|action|ask|routing|sdd|close|tdd|checkpoint|review]` corre casos etiquetados con las
 mismas preguntas y umbrales que los chequeos reales, para probar cambios de
 umbral o de modelo antes de usarlos.
 
