@@ -365,10 +365,20 @@ TDD es un complemento de SDD. Con él, los cambios de comportamiento (rutas spec
 y change, y arreglos de bugs) tienen que empezar con un test que falle.
 
 ```bash
-fx sdd tdd on       # primero el test
+fx sdd tdd auto     # por defecto: Jev decide en cada pedido si va primero el test
+fx sdd tdd on       # primero el test, siempre
 fx sdd tdd strict   # además: cada regla cambiada debe citarse en un test
 fx sdd tdd off
 ```
+
+En modo **auto**, antes del primer cambio de código del turno Jev clasifica el
+pedido: lógica o datos (`behavior`), un bug (`regression`), solo cómo se ve
+(`presentation`) o algo sin comportamiento (`trivial`), y si un test unitario
+podría comprobarlo sin leer el código como texto. Los cambios de lógica y los
+bugs van con test primero; los de presentación y los triviales no, pero los
+tests igual tienen que pasar después del último cambio. Si Jev no responde o
+duda, el cambio va con test primero, como en `on`. La decisión queda en el
+registro de Jev de la sesión.
 
 ### Qué exige fx
 
@@ -398,7 +408,8 @@ test("resta los pagos", () => { ... });
 ```
 
 Una regla cuyo título termina en `(manual)`, o un cambio con `tdd: manual`, se
-comprueba en la app corriendo. Un fix o actualización de spec que crece a más
+comprueba en la app corriendo. fx relee esas marcas antes de frenar un cambio,
+así que agregarlas a mitad de turno también cuenta. Un fix o actualización de spec que crece a más
 de 8 archivos de código se frena una vez para que el agente proponga un cambio.
 
 ## Permisos y reglas del proyecto
@@ -506,14 +517,14 @@ archivo Markdown por decisión en `sdd/decisions`, `docs/decisions`, `docs/adr`
 o `decisions` (front matter `title`/`status`/`description` opcional). Cada
 registro se marca una vez por sesión.
 
-`fx jev eval [stop|plan|action|ask|routing|sdd|close]` corre casos etiquetados con las
+`fx jev eval [stop|plan|action|ask|routing|sdd|close|tdd]` corre casos etiquetados con las
 mismas preguntas y umbrales que los chequeos reales, para probar cambios de
 umbral o de modelo antes de usarlos.
 
 ### Configuración de SDD
 
 Por proyecto en `~/.fx/settings.json` → `workspaces["<ruta>"].sdd`: `enabled`,
-`tdd` (`off`, `on`, `strict`) y `test` (un comando de tests propio). Un
+`tdd` (`off`, `auto`, `on`, `strict`; `auto` por defecto) y `test` (un comando de tests propio). Un
 `"sdd": {"enabled": true}` en el nivel superior define el valor por defecto
 para todos los proyectos. `FX_SDD=on|off` lo sobrescribe para una shell o una
 ejecución de CI.

@@ -17,7 +17,7 @@ pub const Action = enum { status, on, off, key, forget, check, eval, drift };
 
 pub const usage =
     \\usage: fx jev [on|off|key|forget|check]
-    \\       fx jev eval [stop|plan|action|ask|routing|sdd|close]
+    \\       fx jev eval [stop|plan|action|ask|routing|sdd|close|tdd]
     \\       fx jev drift [<git-range>] [--dir <decisions-dir>]
     \\
 ;
@@ -174,7 +174,7 @@ pub fn renderStatus(alloc: Allocator, config: jev_config.Config, key: KeyStatus,
     if (config.sdd_gate) {
         try w.print("  {s}route file changes to fix, spec or change (with SDD on)\n", .{label});
         label = indent;
-        try w.print("  {s}test-first behavior changes (with `fx sdd tdd on`)\n", .{label});
+        try w.print("  {s}test-first behavior changes (with SDD on; Jev decides under `tdd auto`)\n", .{label});
     }
     if (config.drift_gate) {
         try w.print("  {s}spec rules after changes (with SDD on)\n", .{label});

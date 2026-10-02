@@ -72,6 +72,9 @@ pub const Gate = struct {
     tdd_green_asked: bool = false,
     tdd_weak_asked: bool = false,
     tdd_uncited_asked: bool = false,
+    /// With `tdd: auto`, Jev's call on whether this turn's change is
+    /// test-first; null until the first source change asks.
+    tdd_need: ?tdd_gate.Need = null,
     /// The SDD route needs no more checks this turn.
     sdd_settled: bool = false,
     /// Set when this turn routed to change; later file changes re-check the
@@ -338,6 +341,7 @@ pub const Gate = struct {
         self.tdd_green_asked = false;
         self.tdd_weak_asked = false;
         self.tdd_uncited_asked = false;
+        self.tdd_need = null;
         self.sdd_settled = false;
         self.sdd_change = null;
         self.sdd_incomplete_held = false;
@@ -653,6 +657,13 @@ pub const Gate = struct {
             return .{ .block = self.lend(try tdd_gate.growthReason(self.alloc, evidence.source_files)) };
         }
         if (!self.requiresTests() or evidence.source_changed or evidence.red) return .continue_;
+        // `(manual)` or `tdd: manual` may have been added after the route
+        // was settled, as the red reason suggests.
+        if (self.manualNow(input)) {
+            self.sdd_route.?.manual = true;
+            return .continue_;
+        }
+        if (mode.tdd == .auto and try self.decideNeed(input, path) == .no_test) return .continue_;
         const max_holds: u8 = if (mode.tdd == .strict) 4 else 2;
         var entry = self.newEntry("tdd", input.invocation, 0);
         if (self.tdd_holds >= max_holds) {
@@ -665,6 +676,62 @@ pub const Gate = struct {
         entry.detail = "no failing test before the source change";
         decision_log.append(self.alloc, entry);
         return .{ .block = tdd_gate.red_reason };
+    }
+
+    /// Asks Jev once per turn whether the change is test-first. An
+    /// unavailable or incomplete answer is test-first, as with `tdd: on`.
+    fn decideNeed(self: *Gate, input: hooks.PreToolUseInput, path: []const u8) !tdd_gate.Need {
+        if (self.tdd_need) |need| return need;
+        self.tdd_need = .test_first;
+        var entry = self.newEntry("tdd", input.invocation, tdd_gate.need_confidence);
+        const state = try tdd_gate.buildNeedState(self.alloc, .{
+            .user_request = input.user_request,
+            .assistant_text = input.assistant_text,
+            .path = path,
+            .arguments_json = input.arguments_json,
+        });
+        defer self.alloc.free(state);
+        var response = self.consult(&entry, state, &tdd_gate.need_questions) orelse return .test_first;
+        defer response.deinit();
+        const need = tdd_gate.evaluateNeed(&response) orelse {
+            self.logIncomplete(&entry, error.IncompleteJevAnswer);
+            return .test_first;
+        };
+        self.tdd_need = need;
+        entry.outcome = @tagName(need);
+        if (response.choice(tdd_gate.change_kind_id)) |kind| entry.detail = kind.choice;
+        decision_log.append(self.alloc, entry);
+        return need;
+    }
+
+    /// Re-reads the manual markers for the settled route from disk.
+    fn manualNow(self: *const Gate, input: hooks.PreToolUseInput) bool {
+        const root_path = input.invocation.scope.workspace_root;
+        const route = self.sdd_route orelse return false;
+        if (route.manual) return true;
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const io = io_mod.getIo();
+        var root = std.Io.Dir.cwd().openDir(io, root_path, .{}) catch return false;
+        defer root.close(io);
+        switch (route.route) {
+            .change => {
+                const changes = sdd_layout.listChanges(arena, root) catch return false;
+                const context = turnContext(arena, input.user_request, input.assistant_text, input.turn_messages) catch return false;
+                const approved = sdd_layout.activeChange(changes, context) orelse return false;
+                return approved.tdd_manual;
+            },
+            .spec => {
+                if (self.sdd_touched.items.len == 0) return false;
+                const rules = sdd_layout.listRules(arena, root) catch return false;
+                for (self.sdd_touched.items) |touched| {
+                    if (!manualRule(rules, touched)) return false;
+                }
+                return true;
+            },
+            .fix, .unclear => return false,
+        }
     }
 
     /// Green, meaningful-test and (strict) citation checks at the end of a
@@ -1058,6 +1125,23 @@ fn specCitations(arena: Allocator, root_path: []const u8) []const u8 {
 }
 
 /// The `path` argument of a file tool call, if present.
+/// Whether the rule titled `title` (with or without a `(manual)` suffix) is
+/// now marked manual.
+fn manualRule(rules: []const sdd_layout.Rule, title: []const u8) bool {
+    const base = manualBase(title);
+    for (rules) |rule| {
+        if (std.mem.eql(u8, manualBase(rule.title), base)) return tdd_gate.isManual(rule.title);
+    }
+    return false;
+}
+
+fn manualBase(title: []const u8) []const u8 {
+    const trimmed = std.mem.trimEnd(u8, title, " ");
+    const suffix = "(manual)";
+    if (!std.mem.endsWith(u8, trimmed, suffix)) return trimmed;
+    return std.mem.trimEnd(u8, trimmed[0 .. trimmed.len - suffix.len], " ");
+}
+
 fn toolPath(arena: Allocator, arguments_json: []const u8) ?[]const u8 {
     return argString(arena, arguments_json, "path");
 }
@@ -1238,6 +1322,17 @@ test "unparseable questions and routed calls with a model skip Jev" {
     input.tool_name = routing.tool_name;
     input.arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"t\",\"model\":\"m\"}}";
     try std.testing.expect((try Gate.preToolUseHandler(&gate, input)) == .continue_);
+}
+
+test "manualRule sees a (manual) suffix added after routing" {
+    const rules = [_]sdd_layout.Rule{
+        .{ .capability = "ministerio", .title = "Date centered (manual)", .body = "" },
+        .{ .capability = "ministerio", .title = "Coverage needs the real boleto", .body = "" },
+    };
+    try std.testing.expect(manualRule(&rules, "Date centered"));
+    try std.testing.expect(manualRule(&rules, "Date centered (manual)"));
+    try std.testing.expect(!manualRule(&rules, "Coverage needs the real boleto"));
+    try std.testing.expect(!manualRule(&rules, "Missing rule"));
 }
 
 test "changedFiles looks for successful file tool results" {

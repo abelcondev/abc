@@ -215,9 +215,71 @@ pub const meaningful_id = "tests_check_request";
 
 pub const questions = [_]jev_contract.Question{.{
     .id = meaningful_id,
-    .instructions = "The tests in `changed_tests` would fail if the behavior `user_request` asks for were missing or wrong; they are not trivially true, skipped, or only checking that code runs",
+    .instructions = "The tests in `changed_tests` would fail if the behavior `user_request` asks for were missing or wrong; they are not trivially true, skipped, only checking that code runs, or reading source files as text to look for strings such as class names",
     .kind = .noul,
 }};
+
+// With `tdd: auto`, Jev decides per request whether the change is test-first.
+pub const change_kind_id = "change_kind";
+pub const unit_testable_id = "unit_testable";
+/// Confidence the change kind needs before the gate trusts it; below it the
+/// change is test-first.
+pub const need_confidence = 0.5;
+
+pub const need_questions = [_]jev_contract.Question{
+    .{
+        .id = change_kind_id,
+        .instructions = "What kind of code change `user_request` asks for, judged by the request and the `pending_change`",
+        .kind = .{ .choice = &.{
+            .{ .name = "behavior", .description = "new or changed logic, data, calculations, validation, parsing, state, permissions, or an API or data contract" },
+            .{ .name = "regression", .description = "a fix for code that behaves wrongly (a bug)" },
+            .{ .name = "presentation", .description = "only how things look: layout, alignment, spacing, styling, icons, labels or copy, or moving, showing or hiding UI elements" },
+            .{ .name = "trivial", .description = "a rename, comment, formatting, configuration value or other change with no behavior" },
+        } },
+    },
+    .{
+        .id = unit_testable_id,
+        .instructions = "What `user_request` asks for can be checked by a unit test that calls a function or module of the project and checks its result; checking it would not need a browser, a screenshot, or reading source files as text",
+        .kind = .noul,
+    },
+};
+
+pub const Need = enum { test_first, no_test };
+
+/// Combines the change-kind answers. Unsure answers are test-first; a
+/// missing answer is null, never a pass.
+pub fn evaluateNeed(response: *const jev_contract.Response) ?Need {
+    const kind = response.choice(change_kind_id) orelse return null;
+    const testable = response.noul(unit_testable_id) orelse return null;
+    if (kind.confidence < need_confidence) return .test_first;
+    const name = kind.choice;
+    if (std.mem.eql(u8, name, "presentation") or std.mem.eql(u8, name, "trivial")) return .no_test;
+    return if (testable >= need_confidence) .test_first else .no_test;
+}
+
+pub const NeedInput = struct {
+    user_request: []const u8,
+    assistant_text: []const u8,
+    path: []const u8,
+    arguments_json: []const u8,
+};
+
+/// Builds the Jev `state` JSON for the change-kind questions. Caller owns
+/// the returned bytes.
+pub fn buildNeedState(alloc: Allocator, input: NeedInput) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    var jw: std.json.Stringify = .{ .writer = &out.writer };
+    try jw.beginObject();
+    try jw.objectField("user_request");
+    try jw.write(turn_text.clip(input.user_request, Limits.request_bytes));
+    try jw.objectField("agent_message");
+    try jw.write(turn_text.clip(input.assistant_text, Limits.output_bytes));
+    try jw.objectField("pending_change");
+    try jw.write(.{ .path = input.path, .arguments = turn_text.clip(input.arguments_json, Limits.test_bytes) });
+    try jw.endObject();
+    return out.toOwnedSlice();
+}
 
 /// Builds the Jev `state` JSON for the meaningful-test question. Caller
 /// owns the returned bytes.
@@ -410,4 +472,43 @@ test "buildState carries the changed tests and the passing run" {
     defer alloc.free(state);
     try std.testing.expect(std.mem.find(u8, state, "tests/saldo.test.ts") != null);
     try std.testing.expect(std.mem.find(u8, state, "\"passing_run\":\"1 pass\"") != null);
+}
+
+test "evaluateNeed exempts presentation and keeps unsure or testable behavior test-first" {
+    const cases = [_]struct { body: []const u8, want: ?Need }{
+        .{ .body =
+        \\{"model":"m","answers":{"change_kind":{"type":"choice","choice":"presentation","confidence":1.0},"unit_testable":{"type":"noul","noul":0.3}}}
+        , .want = .no_test },
+        .{ .body =
+        \\{"model":"m","answers":{"change_kind":{"type":"choice","choice":"behavior","confidence":0.9},"unit_testable":{"type":"noul","noul":0.8}}}
+        , .want = .test_first },
+        .{ .body =
+        \\{"model":"m","answers":{"change_kind":{"type":"choice","choice":"behavior","confidence":0.9},"unit_testable":{"type":"noul","noul":0.2}}}
+        , .want = .no_test },
+        .{ .body =
+        \\{"model":"m","answers":{"change_kind":{"type":"choice","choice":"presentation","confidence":0.4},"unit_testable":{"type":"noul","noul":0.1}}}
+        , .want = .test_first },
+        .{ .body =
+        \\{"model":"m","answers":{"change_kind":{"type":"choice","choice":"trivial","confidence":0.9}}}
+        , .want = null },
+    };
+    for (cases) |case| {
+        var response = try jev_contract.parseResponse(std.testing.allocator, case.body);
+        defer response.deinit();
+        try std.testing.expectEqual(case.want, evaluateNeed(&response));
+    }
+}
+
+test "buildNeedState carries the request and the pending change" {
+    const state = try buildNeedState(std.testing.allocator, .{
+        .user_request = "center the date",
+        .assistant_text = "Centering the header.",
+        .path = "src/Card.tsx",
+        .arguments_json = "{\"path\":\"src/Card.tsx\"}",
+    });
+    defer std.testing.allocator.free(state);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, state, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("center the date", parsed.value.object.get("user_request").?.string);
+    try std.testing.expectEqualStrings("src/Card.tsx", parsed.value.object.get("pending_change").?.object.get("path").?.string);
 }
