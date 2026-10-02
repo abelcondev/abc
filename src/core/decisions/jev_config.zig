@@ -72,6 +72,9 @@ pub const Config = struct {
     /// Hold a shell command that rewrites a few files in place when
     /// `edit_file` fits better (`scripted_edit.zig`).
     edits_gate: bool = true,
+    /// Before a new workspace memory fact is written, check that it is worth
+    /// keeping and not a repeat (`memory_gate.zig`).
+    memory_gate: bool = true,
     /// Check file changes and shell commands against the request.
     action_gate: bool = false,
     /// Probability of unrequested damage at which an action is held.
@@ -92,7 +95,7 @@ pub const Config = struct {
 
     /// Whether any gate needs the PreToolUse hook.
     pub fn usesPreToolUse(self: Config) bool {
-        return self.plan_gate or self.ask_gate or self.action_gate or self.sdd_gate or self.checkpoint_gate or self.review_gate or self.edits_gate or self.routes.len != 0;
+        return self.plan_gate or self.ask_gate or self.action_gate or self.sdd_gate or self.checkpoint_gate or self.review_gate or self.edits_gate or self.memory_gate or self.routes.len != 0;
     }
 
     fn setModel(self: *Config, alloc: Allocator, value: []const u8) !void {
@@ -154,6 +157,9 @@ pub fn applyJson(alloc: Allocator, config: *Config, value: std.json.Value) !void
             }
             if (gates.object.get("edits")) |edits| {
                 if (edits == .bool) config.edits_gate = edits.bool;
+            }
+            if (gates.object.get("memory")) |memory| {
+                if (memory == .bool) config.memory_gate = memory.bool;
             }
         }
     }

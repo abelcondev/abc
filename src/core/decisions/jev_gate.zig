@@ -47,6 +47,8 @@ const checkpoint = @import("checkpoint.zig");
 const pr_review = @import("pr_review.zig");
 const visual_check = @import("visual_check.zig");
 const scripted_edit = @import("scripted_edit.zig");
+const memory_gate = @import("memory_gate.zig");
+const memory_store = @import("../memory/memory_store.zig");
 const turn_text = @import("turn_text.zig");
 
 const Allocator = std.mem.Allocator;
@@ -67,6 +69,8 @@ pub const Gate = struct {
     action_holds: u8 = 0,
     /// A scripted edit was already held this turn.
     edit_held: bool = false,
+    /// A memory fact was already held this turn.
+    memory_held: bool = false,
     /// SDD mode for this turn's workspace, loaded on the first file change.
     sdd_turn_mode: ?sdd_mode.Mode = null,
     /// The route this turn's work goes through once code may change; null
@@ -371,6 +375,7 @@ pub const Gate = struct {
         self.plan_holds = 0;
         self.action_holds = 0;
         self.edit_held = false;
+        self.memory_held = false;
         self.sdd_turn_mode = null;
         self.sdd_route = null;
         self.clearTouched();
@@ -499,6 +504,13 @@ pub const Gate = struct {
                 };
                 if (edit_action != .continue_) break :blk edit_action;
             }
+            if (config.memory_gate and !self.memory_held and std.mem.eql(u8, tool, "write_file")) {
+                const memory_action = self.checkMemory(input) catch |err| memory: {
+                    debug_trace.logf("jev", "memory gate failed err={s}", .{@errorName(err)});
+                    break :memory hooks.PreToolUseAction.continue_;
+                };
+                if (memory_action != .continue_) break :blk memory_action;
+            }
             if (config.sdd_gate and plan_gate.isFileChange(tool)) {
                 if (!self.sdd_settled) {
                     const sdd_action = self.checkSdd(input) catch |err| sdd: {
@@ -591,6 +603,50 @@ pub const Gate = struct {
         entry.outcome = "hold";
         decision_log.append(self.alloc, entry);
         return .{ .block = scripted_edit.hold_reason };
+    }
+
+    /// Holds a new workspace memory fact once per turn when Jev judges it not
+    /// worth keeping or a repeat of an index entry.
+    fn checkMemory(self: *Gate, input: hooks.PreToolUseInput) !hooks.PreToolUseAction {
+        const home = io_mod.getenv("HOME") orelse return .continue_;
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const raw_path = toolPath(arena, input.arguments_json) orelse return .continue_;
+        const path = if (std.mem.startsWith(u8, raw_path, "~/")) try std.fs.path.join(arena, &.{ home, raw_path[2..] }) else raw_path;
+        const root_path = input.invocation.scope.workspace_root;
+        if (!memory_store.isFactPath(arena, home, root_path, path)) return .continue_;
+        const io = io_mod.getIo();
+        // Rewriting an existing fact is an update, not a new fact.
+        if (std.Io.Dir.cwd().access(io, path, .{})) |_| return .continue_ else |_| {}
+        const fact = argString(arena, input.arguments_json, "content") orelse return .continue_;
+        const dir = try memory_store.dirFor(arena, home, root_path);
+        const index_path = try std.fs.path.join(arena, &.{ dir, memory_store.index_name });
+        const index = std.Io.Dir.cwd().readFileAlloc(io, index_path, arena, .limited(64 * 1024)) catch "";
+        const with_index = std.mem.trim(u8, index, " \t\r\n").len != 0;
+        var entry = self.newEntry("memory", input.invocation, memory_gate.worth_threshold);
+        const state = try memory_gate.buildState(self.alloc, input.user_request, fact, index);
+        defer self.alloc.free(state);
+        const questions: []const jev_contract.Question = if (with_index) &memory_gate.questions_with_index else &memory_gate.questions_without_index;
+        var response = self.consult(&entry, state, questions) orelse return .continue_;
+        defer response.deinit();
+        const verdict = memory_gate.evaluate(&response, with_index) orelse {
+            self.logIncomplete(&entry, error.IncompleteJevAnswer);
+            return .continue_;
+        };
+        entry.outcome = @tagName(verdict);
+        decision_log.append(self.alloc, entry);
+        return switch (verdict) {
+            .save => .continue_,
+            .not_worth => blk: {
+                self.memory_held = true;
+                break :blk .{ .block = memory_gate.not_worth_reason };
+            },
+            .duplicate => blk: {
+                self.memory_held = true;
+                break :blk .{ .block = memory_gate.duplicate_reason };
+            },
+        };
     }
 
     fn checkAsk(self: *Gate, input: hooks.PreToolUseInput) !hooks.PreToolUseAction {

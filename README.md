@@ -21,6 +21,7 @@ independiente que mantiene al agente honesto.
 - [Jev: el revisor del agente](#jev-el-revisor-del-agente)
 - [SDD: specs antes de los cambios grandes](#sdd-specs-antes-de-los-cambios-grandes)
 - [TDD: primero los tests](#tdd-primero-los-tests)
+- [Memoria del workspace](#memoria-del-workspace)
 - [Permisos y reglas del proyecto](#permisos-y-reglas-del-proyecto)
 - [Dónde vive la configuración](#dónde-vive-la-configuración)
 - [Referencia](#referencia)
@@ -441,6 +442,25 @@ comprueba en la app corriendo. fx relee esas marcas antes de frenar un cambio,
 así que agregarlas a mitad de turno también cuenta. Un fix o actualización de spec que crece a más
 de 8 archivos de código se frena una vez para que el agente proponga un cambio.
 
+## Memoria del workspace
+
+fx guarda lo que vale la pena recordar entre sesiones en
+`~/.fx/memory/<workspace>/`: un archivo markdown por hecho y un índice
+`MEMORY.md` con una línea por hecho. En cada pedido el agente ve el índice y
+las reglas para mantenerlo, y lee el archivo de un hecho solo cuando su línea
+es relevante.
+
+- **Qué se guarda:** quién eres y tus preferencias (`user`), cómo quieres que
+  trabaje (`feedback`), objetivos y restricciones en curso (`project`) y
+  referencias externas (`reference`). Nada que el repo o git ya registren.
+- **Jev filtra:** antes de escribir un hecho nuevo, Jev decide si sirve a futuro y no se deduce del
+  repo, y si repite una entrada del índice. En ese caso el agente actualiza la
+  existente.
+- **Permisos:** son archivos de tu perfil fuera del workspace; `write_file` y
+  `edit_file` los escriben con la política de permisos normal.
+- **Apagarla:** `"memory": { "enabled": false }` en `~/.fx/settings.json`, o
+  `FX_MEMORY=off`. El chequeo de Jev se apaga con `jev.gates.memory`.
+
 ## Permisos y reglas del proyecto
 
 **Permisos.** `/permissions` cambia entre:
@@ -467,6 +487,7 @@ respuesta, gestor de paquetes, dónde viven los tests).
 | SDD y TDD, por proyecto | `~/.fx/settings.json` → `workspaces["<ruta>"].sdd` | `FX_SDD=on\|off` |
 | Valores del proyecto que se pueden commitear | `<proyecto>/.fx.json` | |
 | Sesiones, registro de decisiones, recibos y trabajo de Jev | `~/.fx/sessions/<id>/` (`decisions.jsonl`, `receipts.jsonl`, `work.jsonl`) | |
+| Memoria del workspace | `~/.fx/memory/<workspace>/` (`MEMORY.md` y un archivo por hecho) | `FX_MEMORY=on\|off` |
 
 Fuera de macOS, las keys guardadas van a un archivo privado en
 `~/.fx/provider-keys`. La configuración de Jev y SDD vive solo en tu perfil: el
@@ -531,6 +552,7 @@ Dentro de `jev` en `~/.fx/settings.json`:
 | `gates.visual` | Pide una captura con Iris después de cambios visuales (por defecto `true`) |
 | `visual.model` | Modelo con visión para un subagente que mira la captura cuando el modelo de la sesión no lee imágenes |
 | `gates.edits` | Frena ediciones puntuales hechas con scripts para usar `edit_file` (por defecto `true`) |
+| `gates.memory` | Revisa que un hecho nuevo de memoria valga la pena y no repita otro (por defecto `true`) |
 | `gates.action` | Revisa cambios de archivos y comandos de shell (por defecto `false`) |
 | `gates.stop` | Corre el chequeo de finalización (por defecto `true`) |
 | `thresholds.ask` | Confianza y respaldo mínimos para responder (por defecto `0.8`) |
@@ -551,7 +573,7 @@ archivo Markdown por decisión en `sdd/decisions`, `docs/decisions`, `docs/adr`
 o `decisions` (front matter `title`/`status`/`description` opcional). Cada
 registro se marca una vez por sesión.
 
-`fx jev eval [stop|plan|action|ask|routing|sdd|close|tdd|checkpoint|review|visual|drift|edits]` corre casos etiquetados con las
+`fx jev eval [stop|plan|action|ask|routing|sdd|close|tdd|checkpoint|review|visual|drift|edits|memory]` corre casos etiquetados con las
 mismas preguntas y umbrales que los chequeos reales, para probar cambios de
 umbral o de modelo antes de usarlos.
 

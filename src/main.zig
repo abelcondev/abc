@@ -4404,6 +4404,8 @@ test {
     _ = @import("core/decisions/pr_review.zig");
     _ = @import("core/decisions/visual_check.zig");
     _ = @import("core/decisions/scripted_edit.zig");
+    _ = @import("core/memory/memory_store.zig");
+    _ = @import("core/decisions/memory_gate.zig");
     _ = provider_runtime;
     _ = @import("acp/prompt.zig");
     _ = @import("core/output/activity_status.zig");
