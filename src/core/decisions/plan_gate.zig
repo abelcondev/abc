@@ -56,12 +56,12 @@ pub const questions = [_]jev_contract.Question{
     },
     .{
         .id = plan_covers_id,
-        .instructions = "The plan in `agent_messages` covers everything `user_request` asks for",
+        .instructions = "The plan in `agent_messages`, together with any later amendment there, covers everything `user_request` asks for",
         .kind = .noul,
     },
     .{
         .id = plan_extra_id,
-        .instructions = "The plan in `agent_messages` includes significant work that `user_request` did not ask for",
+        .instructions = "The plan in `agent_messages`, after any later amendment there that drops steps, still includes significant work that `user_request` did not ask for",
         .kind = .noul,
     },
 };
@@ -114,11 +114,20 @@ pub fn blockReason(alloc: Allocator, verdict: @FieldType(Verdict, "needs_plan"))
     if (verdict.issues.contains(.no_plan)) try w.writeAll(" No plan has been stated yet.");
     if (verdict.issues.contains(.incomplete_plan)) try w.writeAll(" The stated plan does not cover everything the user asked for.");
     if (verdict.issues.contains(.extra_work)) try w.writeAll(" The stated plan adds work the user did not ask for.");
-    try w.writeAll(
-        " Before changing files, write a short plan in your reply: numbered steps saying what you will change, " ++
-            "and acceptance criteria you will check with tools (tests, a build, or reading the result back). " ++
-            "Keep it to what the user asked, then make the change in the same reply.",
-    );
+    if (verdict.issues.contains(.no_plan)) {
+        try w.writeAll(
+            " Before changing files, write a short plan in your reply: numbered steps saying what you will change, " ++
+                "and acceptance criteria you will check with tools (tests, a build, or reading the result back). " ++
+                "Keep it to what the user asked, then make the change in the same reply.",
+        );
+    } else {
+        // A plan exists; restating it in full shows the user the same plan
+        // twice. The amendment is read together with the earlier plan.
+        try w.writeAll(
+            " Do not restate the plan. Reply with only the amendment in one or two lines: the steps you add for what " ++
+                "is missing and the steps you drop because the user did not ask for them. Then make the change.",
+        );
+    }
     return out.toOwnedSlice();
 }
 
@@ -211,4 +220,18 @@ test "isFileChange covers write and edit only" {
     try std.testing.expect(isFileChange("edit_file"));
     try std.testing.expect(!isFileChange("shell"));
     try std.testing.expect(!isFileChange("read_file"));
+}
+
+test "blockReason asks for an amendment once a plan exists" {
+    var extra = std.EnumSet(Issue).initEmpty();
+    extra.insert(.extra_work);
+    const amend = try blockReason(std.testing.allocator, .{ .scope_confidence = 0.9, .issues = extra });
+    defer std.testing.allocator.free(amend);
+    try std.testing.expect(std.mem.find(u8, amend, "Do not restate the plan") != null);
+    try std.testing.expect(std.mem.find(u8, amend, "numbered steps") == null);
+    var none = std.EnumSet(Issue).initEmpty();
+    none.insert(.no_plan);
+    const fresh = try blockReason(std.testing.allocator, .{ .scope_confidence = 0.9, .issues = none });
+    defer std.testing.allocator.free(fresh);
+    try std.testing.expect(std.mem.find(u8, fresh, "numbered steps") != null);
 }
