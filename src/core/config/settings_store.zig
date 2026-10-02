@@ -910,7 +910,7 @@ fn validateMutation(mutation: SettingsMutation) !void {
         .workspace_sdd => |workspace_sdd| {
             try validateWorkspaceRoot(workspace_sdd.workspace_root);
             if (workspace_sdd.tdd) |tdd| {
-                if (!std.mem.eql(u8, tdd, "off") and !std.mem.eql(u8, tdd, "on") and !std.mem.eql(u8, tdd, "strict")) {
+                if (!std.mem.eql(u8, tdd, "off") and !std.mem.eql(u8, tdd, "auto") and !std.mem.eql(u8, tdd, "on") and !std.mem.eql(u8, tdd, "strict")) {
                     return error.InvalidDurableField;
                 }
             }

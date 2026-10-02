@@ -3,7 +3,7 @@
 //! `fx sdd` prints the status; `on`/`off` persist
 //! `workspaces["<root>"].sdd.enabled` in the profile settings; `new <slug>`
 //! writes `sdd/changes/<date>-<slug>.md`; `approve` and `done` set a change's
-//! status; `tdd off|on|strict` saves `workspaces["<root>"].sdd.tdd`. `/sdd`
+//! status; `tdd off|auto|on|strict` saves `workspaces["<root>"].sdd.tdd`. `/sdd`
 //! in a session accepts the same subcommands.
 
 const std = @import("std");
@@ -17,8 +17,8 @@ const Allocator = std.mem.Allocator;
 
 pub const Action = enum { status, on, off, new, approve, done, tdd };
 
-pub const usage = "usage: fx sdd [on|off|new <slug>|approve [<change>]|done [<change>]|tdd off|on|strict]\n";
-pub const slash_usage = "usage: /sdd [on|off|new <slug>|approve [<change>]|done [<change>]|tdd off|on|strict]";
+pub const usage = "usage: fx sdd [on|off|new <slug>|approve [<change>]|done [<change>]|tdd off|auto|on|strict]\n";
+pub const slash_usage = "usage: /sdd [on|off|new <slug>|approve [<change>]|done [<change>]|tdd off|auto|on|strict]";
 
 pub const Parsed = struct {
     action: Action,
@@ -132,7 +132,11 @@ pub fn renderStatus(alloc: Allocator, mode: sdd_mode.Mode, context: StatusContex
         }
         if (context.sdd_gate and mode.tdd != .off) {
             if (any) try w.writeAll("             ");
-            try w.writeAll(if (mode.tdd == .strict) "test-first behavior changes; every changed rule cited by a test\n" else "test-first behavior changes and bug fixes\n");
+            try w.writeAll(switch (mode.tdd) {
+                .strict => "test-first behavior changes; every changed rule cited by a test\n",
+                .auto => "Jev decides per request whether a change is test-first; tests pass after code changes\n",
+                else => "test-first behavior changes and bug fixes\n",
+            });
             any = true;
         }
         if (!any) try w.writeAll("none; the Jev sdd and drift gates are off\n");

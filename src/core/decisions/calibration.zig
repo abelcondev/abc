@@ -16,12 +16,13 @@ const action_gate = @import("action_gate.zig");
 const ask_gate = @import("ask_gate.zig");
 const routing = @import("routing.zig");
 const sdd_gate = @import("sdd_gate.zig");
+const tdd_gate = @import("tdd_gate.zig");
 const sdd_layout = @import("../sdd/sdd_layout.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
 
-pub const Gate = enum { stop, plan, action, ask, routing, sdd, close };
+pub const Gate = enum { stop, plan, action, ask, routing, sdd, close, tdd };
 
 const Case = struct {
     gate: Gate,
@@ -149,6 +150,17 @@ pub const cases = [_]Case{
     .{ .gate = .close, .name = "asks for a fix", .expect = "open", .user_request = "falta que el tramo sea obligatorio, arreglalo", .assistant_text = review_request, .proposal = trenes_done },
     .{ .gate = .close, .name = "only asks a question", .expect = "open", .user_request = "¿qué archivos cambiaste?", .assistant_text = review_request, .proposal = trenes_done },
     .{ .gate = .close, .name = "other work", .expect = "open", .user_request = "ahora agregá un filtro por fecha en la lista de reservas", .assistant_text = review_request, .proposal = trenes_done },
+
+    // TDD need (`tdd: auto`), from a real booking app session.
+    .{ .gate = .tdd, .name = "center the date", .expect = "no_test", .user_request = "puedes alinear la fecha al centro horizontal, ahora se ve a la izquierda", .tool = "edit_file", .arguments = "{\"path\":\"src/components/tickets/MinistryBoletoFields.tsx\",\"old_string\":\"<div className=\\\"flex flex-wrap items-center gap-3\\\">\",\"new_string\":\"<div className=\\\"flex items-center\\\"><div className=\\\"min-w-0 flex-1 text-center\\\">\"}" },
+    .{ .gate = .tdd, .name = "move a section", .expect = "no_test", .user_request = "ok pon la seccion Ministerio debajo de la seccion Trenes", .tool = "edit_file", .arguments = "{\"path\":\"src/components/booking/BookingDetail.tsx\",\"old_string\":\"<BookingTrenes bookingId={bookingId} />\",\"new_string\":\"<BookingTrenes bookingId={bookingId} />\\n<BookingMinisterio bookingId={bookingId} />\"}" },
+    .{ .gate = .tdd, .name = "bold check in the badge", .expect = "no_test", .user_request = "en el badge 'Registrado' que vaya con un icono check bold y eliminar el check grande que tiene al costado de la fecha", .tool = "edit_file", .arguments = "{\"path\":\"src/components/tickets/MinistryBoletoFields.tsx\",\"old_string\":\"<Badge tone=\\\"teal\\\">Registrado</Badge>\",\"new_string\":\"<Badge tone=\\\"teal\\\"><CheckIcon strokeWidth={3} /> Registrado</Badge>\"}" },
+    .{ .gate = .tdd, .name = "text instead of badges", .expect = "no_test", .user_request = "las divisiones tienen que ser con background sin lineas divisoras. VENTA y MIMI como titulos encima del card interno. No uses badges para circuito, usa solo textos.", .tool = "edit_file", .arguments = "{\"path\":\"src/components/tickets/MinistryBoletoFields.tsx\",\"old_string\":\"<div className=\\\"border-t\\\">{labels.map(l => <Badge>{l}</Badge>)}\",\"new_string\":\"<p className=\\\"text-xs uppercase\\\">Venta</p><div className=\\\"rounded-inner bg-surface-2\\\">{labels.join(' · ')}\"}" },
+    .{ .gate = .tdd, .name = "rename a component", .expect = "no_test", .user_request = "renombra MinistryBoletoFields a MinistryBoletoCard", .tool = "edit_file", .arguments = "{\"path\":\"src/components/booking/BookingMinisterio.tsx\",\"old_string\":\"<MinistryBoletoFields\",\"new_string\":\"<MinistryBoletoCard\"}" },
+    .{ .gate = .tdd, .name = "coverage needs the real boleto", .expect = "test_first", .user_request = "la cobertura tiene que marcar check solo cuando hay boleto real registrado por el rol Reservas, no con la propuesta de ventas", .tool = "edit_file", .arguments = "{\"path\":\"src/lib/ministryRegistry.ts\",\"old_string\":\"return tickets.some((t) => !t.deletedAt);\",\"new_string\":\"return tickets.some((t) => !t.deletedAt && Boolean(t.boleto));\"}" },
+    .{ .gate = .tdd, .name = "confirm by naming the action", .expect = "test_first", .user_request = "Mimi descartó el registro cuando respondí 'registralo.' en vez de 'sí'; arreglalo", .tool = "edit_file", .arguments = "{\"path\":\"src/lib/mimiConfirm.ts\",\"old_string\":\"export function parseConfirmReply(body: string)\",\"new_string\":\"export function parsePendingReply(body: string, tool: string)\"}" },
+    .{ .gate = .tdd, .name = "add passengers from the PDF", .expect = "test_first", .user_request = "si el PDF tiene mas pasajeros que la tabla de Pasajeros, que pueda pedirle a Mimi que agregue los que faltan, sin duplicar", .tool = "edit_file", .arguments = "{\"path\":\"src/lib/ministryTicket.ts\",\"old_string\":\"export function boletoSummary(\",\"new_string\":\"export function missingBoletoPassengers(pages, passengers) {\\n  return pages.filter((p) => !passengers.some((x) => sameDoc(x, p)));\\n}\\nexport function boletoSummary(\"}" },
+    .{ .gate = .tdd, .name = "saldo subtracts payments", .expect = "test_first", .user_request = "Saldo shows the total amount instead of subtracting payments; fix it", .tool = "edit_file", .arguments = "{\"path\":\"src/lib/payments.ts\",\"old_string\":\"return booking.amount;\",\"new_string\":\"return booking.amount - paid(booking.payments);\"}" },
 };
 
 pub const Result = struct {
@@ -202,6 +214,10 @@ pub fn run(arena: Allocator, config: jev_config.Config, api_key: []const u8, cas
             questions = &sdd_gate.close_questions;
             state = try sdd_gate.closeState(arena, case.user_request, case.proposal orelse "", case.assistant_text);
         },
+        .tdd => {
+            questions = &tdd_gate.need_questions;
+            state = try tdd_gate.buildNeedState(arena, try needInput(arena, case));
+        },
     }
 
     var response = typesafe.systemOne(arena, .{
@@ -224,6 +240,7 @@ pub fn run(arena: Allocator, config: jev_config.Config, api_key: []const u8, cas
         else |err|
             @errorName(err),
         .close => if (response.noul(sdd_gate.closes_id)) |p| (if (p >= sdd_gate.close_threshold) "closed" else "open") else "IncompleteJevAnswer",
+        .tdd => if (tdd_gate.evaluateNeed(&response)) |need| @tagName(need) else "IncompleteJevAnswer",
     };
     return .{
         .gate = case.gate,
@@ -245,6 +262,12 @@ fn sddInput(case: Case) sdd_gate.Input {
         .rules = case.rules,
         .proposal = case.proposal,
     };
+}
+
+fn needInput(arena: Allocator, case: Case) !tdd_gate.NeedInput {
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, case.arguments, .{});
+    const path = if (parsed == .object) (if (parsed.object.get("path")) |value| (if (value == .string) value.string else "") else "") else "";
+    return .{ .user_request = case.user_request, .assistant_text = case.assistant_text, .path = path, .arguments_json = case.arguments };
 }
 
 fn summarize(arena: Allocator, response: *const jev_contract.Response) ![]const u8 {
@@ -278,6 +301,10 @@ test "every calibration case builds a valid request without calling Jev" {
         }
         if (case.gate == .sdd) {
             const state = try sdd_gate.buildState(arena, sddInput(case));
+            _ = try std.json.parseFromSliceLeaky(std.json.Value, arena, state, .{});
+        }
+        if (case.gate == .tdd) {
+            const state = try tdd_gate.buildNeedState(arena, try needInput(arena, case));
             _ = try std.json.parseFromSliceLeaky(std.json.Value, arena, state, .{});
         }
     }

@@ -10,7 +10,8 @@
 //! "workspaces": { "/path/to/repo": { "sdd": { "enabled": true, "tdd": "on", "test": "bun test" } } }
 //! ```
 //!
-//! `tdd` (`off`, `on` or `strict`) and `test` (the project's test command,
+//! `tdd` (`off`, `auto`, `on` or `strict`; `auto` by default, where Jev
+//! decides per request whether a change is test-first) and `test` (the project's test command,
 //! used besides the common runners fx recognizes) resolve the same way,
 //! workspace first, without the environment override.
 //!
@@ -43,14 +44,14 @@ pub const Source = enum {
     }
 };
 
-pub const Tdd = enum { off, on, strict };
+pub const Tdd = enum { off, auto, on, strict };
 
 pub const max_test_command_bytes = 256;
 
 pub const Mode = struct {
     enabled: bool = false,
     source: Source = .default,
-    tdd: Tdd = .off,
+    tdd: Tdd = .auto,
     test_command_buf: [max_test_command_bytes]u8 = undefined,
     test_command_len: usize = 0,
 
@@ -93,7 +94,7 @@ pub fn resolve(settings: ?std.json.Value, workspace_root: []const u8, env: ?[]co
     }
     const tdd = (if (workspace) |value| sddString(value, "tdd") else null) orelse
         (if (root) |value| sddString(value, "tdd") else null);
-    if (tdd) |text| mode.tdd = std.meta.stringToEnum(Tdd, text) orelse .off;
+    if (tdd) |text| mode.tdd = std.meta.stringToEnum(Tdd, text) orelse .auto;
     const command = (if (workspace) |value| sddString(value, "test") else null) orelse
         (if (root) |value| sddString(value, "test") else null);
     if (command) |text| {
@@ -199,8 +200,9 @@ test "tdd mode and test command resolve workspace first" {
     try std.testing.expectEqual(Tdd.on, repo.tdd);
     try std.testing.expectEqualStrings("make test", repo.testCommand().?);
     const other = resolve(parsed.value, "/other", null);
-    try std.testing.expectEqual(Tdd.off, other.tdd);
+    try std.testing.expectEqual(Tdd.auto, other.tdd);
     try std.testing.expect(resolve(null, "/repo", null).testCommand() == null);
+    try std.testing.expectEqual(Tdd.auto, resolve(null, "/repo", null).tdd);
 }
 
 test "mistyped sdd settings fall back to the next layer" {
