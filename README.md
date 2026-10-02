@@ -225,6 +225,7 @@ En palabras simples:
 | **Checkpoint** | Mezclar trabajos distintos en un solo commit. Cuando un pedido nuevo no es parte del trabajo sin commitear de turnos anteriores, el agente commitea primero ese trabajo (solo sus archivos, sin push). Solo fuera de la rama principal y con tests o build en verde sobre el código actual. | activo |
 | **Review** | Abrir un PR riesgoso sin revisarlo. Antes de `gh pr create` o `gh pr ready`, Jev califica el diff de la rama (bajo, medio o alto). Uno alto, o uno medio de 400 líneas o más, se frena una vez por rama para revisarlo, refutar cada hallazgo contra el código, arreglar los que quedan y listarlos en el PR. | activo |
 | **Visual** | Dar por bueno un cambio de interfaz sin mirarlo. Si el turno cambió archivos de UI y Jev juzga que el cambio se ve en pantalla, el agente saca una captura con [Iris](https://github.com/brijr/iris) y la compara con el pedido. Sin Iris configurado, fx avisa una vez que se saltó el chequeo. | activo |
+| **Edits** | Editar unos pocos archivos con `sed -i`, `perl -pi` o un script de Python, que se saltean el chequeo exacto de `edit_file` y pueden cortar código sin que se note. Si Jev ve un cambio puntual, se frena una vez por turno para usar `edit_file`; los renombres mecánicos en muchos archivos, o un script que pediste, pasan. | activo |
 | **Action** | Borrar, sobrescribir, publicar o salir del proyecto sin que lo pidas. Suma ~0,5 s por llamada. | inactivo |
 | **Routing** | Usar un modelo caro para una tarea trivial de un subagente. | inactivo |
 
@@ -529,6 +530,7 @@ Dentro de `jev` en `~/.fx/settings.json`:
 | `gates.review` | Pide una revisión antes de abrir un PR riesgoso o grande (por defecto `true`) |
 | `gates.visual` | Pide una captura con Iris después de cambios visuales (por defecto `true`) |
 | `visual.model` | Modelo con visión para un subagente que mira la captura cuando el modelo de la sesión no lee imágenes |
+| `gates.edits` | Frena ediciones puntuales hechas con scripts para usar `edit_file` (por defecto `true`) |
 | `gates.action` | Revisa cambios de archivos y comandos de shell (por defecto `false`) |
 | `gates.stop` | Corre el chequeo de finalización (por defecto `true`) |
 | `thresholds.ask` | Confianza y respaldo mínimos para responder (por defecto `0.8`) |
@@ -549,7 +551,7 @@ archivo Markdown por decisión en `sdd/decisions`, `docs/decisions`, `docs/adr`
 o `decisions` (front matter `title`/`status`/`description` opcional). Cada
 registro se marca una vez por sesión.
 
-`fx jev eval [stop|plan|action|ask|routing|sdd|close|tdd|checkpoint|review|visual|drift]` corre casos etiquetados con las
+`fx jev eval [stop|plan|action|ask|routing|sdd|close|tdd|checkpoint|review|visual|drift|edits]` corre casos etiquetados con las
 mismas preguntas y umbrales que los chequeos reales, para probar cambios de
 umbral o de modelo antes de usarlos.
 
