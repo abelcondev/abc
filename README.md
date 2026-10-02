@@ -222,6 +222,7 @@ En palabras simples:
 | **Stop** | "¡Listo!" cuando no está listo, o afirmaciones ("los tests pasan") que ninguna salida muestra. | activo |
 | **Drift** | Specs y registros de decisiones desactualizados tras un cambio. Solo con SDD activo. | activo |
 | **Ruteo SDD** | Cambios grandes sin propuesta. Solo con SDD activo. | activo |
+| **Checkpoint** | Mezclar trabajos distintos en un solo commit. Cuando un pedido nuevo no es parte del trabajo sin commitear de turnos anteriores, el agente commitea primero ese trabajo (solo sus archivos, sin push). Solo fuera de la rama principal y con tests o build en verde sobre el código actual. | activo |
 | **Action** | Borrar, sobrescribir, publicar o salir del proyecto sin que lo pidas. Suma ~0,5 s por llamada. | inactivo |
 | **Routing** | Usar un modelo caro para una tarea trivial de un subagente. | inactivo |
 
@@ -447,7 +448,7 @@ respuesta, gestor de paquetes, dónde viven los tests).
 | Proveedor, modelo, permisos, Jev | `~/.fx/settings.json` | `FX_PROVIDER`, `FX_MODEL`, `FX_PERMISSION_MODE`, `FX_JEV=on\|off` |
 | SDD y TDD, por proyecto | `~/.fx/settings.json` → `workspaces["<ruta>"].sdd` | `FX_SDD=on\|off` |
 | Valores del proyecto que se pueden commitear | `<proyecto>/.fx.json` | |
-| Sesiones, registro de decisiones y recibos de Jev | `~/.fx/sessions/<id>/` (`decisions.jsonl`, `receipts.jsonl`) | |
+| Sesiones, registro de decisiones, recibos y trabajo de Jev | `~/.fx/sessions/<id>/` (`decisions.jsonl`, `receipts.jsonl`, `work.jsonl`) | |
 
 Fuera de macOS, las keys guardadas van a un archivo privado en
 `~/.fx/provider-keys`. La configuración de Jev y SDD vive solo en tu perfil: el
@@ -507,6 +508,7 @@ Dentro de `jev` en `~/.fx/settings.json`:
 | `gates.plan` | Exige un plan antes de cambios en pedidos grandes (por defecto `true`) |
 | `gates.drift` | Marca registros de decisiones que el cambio contradice (por defecto `true`) |
 | `gates.sdd` | Con SDD activo, clasifica el primer cambio como fix, spec o change (por defecto `true`) |
+| `gates.checkpoint` | Commitea el trabajo verificado de turnos anteriores antes de empezar un trabajo distinto (por defecto `true`) |
 | `gates.action` | Revisa cambios de archivos y comandos de shell (por defecto `false`) |
 | `gates.stop` | Corre el chequeo de finalización (por defecto `true`) |
 | `thresholds.ask` | Confianza y respaldo mínimos para responder (por defecto `0.8`) |
@@ -527,7 +529,7 @@ archivo Markdown por decisión en `sdd/decisions`, `docs/decisions`, `docs/adr`
 o `decisions` (front matter `title`/`status`/`description` opcional). Cada
 registro se marca una vez por sesión.
 
-`fx jev eval [stop|plan|action|ask|routing|sdd|close|tdd]` corre casos etiquetados con las
+`fx jev eval [stop|plan|action|ask|routing|sdd|close|tdd|checkpoint]` corre casos etiquetados con las
 mismas preguntas y umbrales que los chequeos reales, para probar cambios de
 umbral o de modelo antes de usarlos.
 

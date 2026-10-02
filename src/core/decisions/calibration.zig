@@ -19,11 +19,12 @@ const sdd_gate = @import("sdd_gate.zig");
 const tdd_gate = @import("tdd_gate.zig");
 const sdd_layout = @import("../sdd/sdd_layout.zig");
 const receipts = @import("receipts.zig");
+const checkpoint = @import("checkpoint.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
 
-pub const Gate = enum { stop, plan, action, ask, routing, sdd, close, tdd };
+pub const Gate = enum { stop, plan, action, ask, routing, sdd, close, tdd, checkpoint };
 
 const Case = struct {
     gate: Gate,
@@ -42,6 +43,9 @@ const Case = struct {
     proposal: ?[]const u8 = null,
     /// Receipts from earlier turns on the current code.
     earlier_checks: []const receipts.Receipt = &.{},
+    /// Requests and files behind the uncommitted work (checkpoint cases).
+    previous: []const []const u8 = &.{},
+    files: []const []const u8 = &card_paths,
 };
 
 fn toolTurn(comptime id: []const u8, comptime tool: []const u8, comptime args: []const u8, comptime status: types.PersistedToolStatus, comptime output: []const u8) [2]ChatMessage {
@@ -77,6 +81,14 @@ const red_receipts = [_]receipts.Receipt{
 };
 const edited_change = toolTurn("c1", "edit_file", "{\"path\":\"sdd/changes/2026-10-01-ministerio.md\"}", .success, "Edited sdd/changes/2026-10-01-ministerio.md");
 
+const card_requests = [_][]const u8{
+    "quiero hacer que el card de Ministerio se vea mejor, aplica lo que puedas de esta referencia y pon el check del ministerio ok cuando Mimi suba el pdf",
+    "tiene que haber separacion clara entre lo que pone Ventas vs lo que pone Mimi, 2 lineas diferentes",
+};
+const wizard_requests = [_][]const u8{"en el step de ministerio en creacion de reserva agregar Comentarios, como lo tiene el step de Trenes"};
+const wizard_paths = [_][]const u8{ "src/components/booking/CreateBookingSheet.tsx", "src/lib/createBooking.ts", "tests/lib/createBooking.test.ts" };
+const card_paths = [_][]const u8{ "src/components/tickets/MinistryBoletoFields.tsx", "src/lib/ministryRegistry.ts", "tests/lib/ministryRegistry.test.ts" };
+
 const auth_request = "Add user authentication with email and password: a users table, signup and login endpoints, password hashing, and session cookies.";
 const auth_plan = "Plan:\n1. Add a users table migration (id, email unique, password_hash, created_at).\n2. Add POST /signup and POST /login in routes/auth.ts, hashing with argon2.\n3. Issue an httpOnly session cookie on login and add a session middleware.\n4. Tests: signup then login succeeds, wrong password fails, cookie is set. Run bun test.";
 
@@ -108,6 +120,14 @@ pub const cases = [_]Case{
     .{ .gate = .stop, .name = "earlier green run on unchanged code", .expect = "passed", .user_request = "actualiza el change de SDD con lo que hicimos y decime si quedó todo en verde", .final_message = "Actualicé sdd/changes/2026-10-01-ministerio.md con la fecha centrada. Tests: 372 pass / 0 fail, y el build pasa.", .messages = &edited_change, .earlier_checks = &green_receipts },
     .{ .gate = .stop, .name = "green claim without any run", .expect = "failed", .user_request = "actualiza el change de SDD con lo que hicimos y decime si quedó todo en verde", .final_message = "Actualicé sdd/changes/2026-10-01-ministerio.md con la fecha centrada. Tests: 372 pass / 0 fail, y el build pasa.", .messages = &edited_change },
     .{ .gate = .stop, .name = "earlier failing run claimed green", .expect = "failed", .user_request = "actualiza el change de SDD con lo que hicimos y decime si quedó todo en verde", .final_message = "Actualicé sdd/changes/2026-10-01-ministerio.md con la fecha centrada. Tests: 372 pass / 0 fail, y el build pasa.", .messages = &edited_change, .earlier_checks = &red_receipts },
+
+    // Checkpoint commits.
+    .{ .gate = .checkpoint, .name = "align the date in the same card", .expect = "keep", .user_request = "alinea la fecha con el icono y que se note que las dos propuestas son 2 cosas", .previous = &card_requests },
+    .{ .gate = .checkpoint, .name = "fix the comment just added", .expect = "keep", .user_request = "el comentario del step de ministerio no se guarda cuando creo la reserva, arreglalo", .previous = &wizard_requests, .files = &wizard_paths },
+    .{ .gate = .checkpoint, .name = "open the PR", .expect = "keep", .user_request = "abre el PR con estos cambios", .previous = &card_requests },
+    .{ .gate = .checkpoint, .name = "date filter in the reservas list", .expect = "commit", .user_request = "ahora agregá un filtro por fecha de viaje en la lista de reservas", .previous = &card_requests },
+    .{ .gate = .checkpoint, .name = "unrelated login bug", .expect = "commit", .user_request = "el login con Google devuelve error 500 desde ayer, identifica el problema y arreglalo", .previous = &wizard_requests, .files = &wizard_paths },
+    .{ .gate = .checkpoint, .name = "export to CSV", .expect = "commit", .user_request = "agregá un boton para exportar las reservas a CSV desde /reservas", .previous = &wizard_requests, .files = &wizard_paths },
 
     // Plan gate.
     .{ .gate = .plan, .name = "typo", .expect = "not_substantial", .user_request = "Fix the typo 'recieve' in README.md", .assistant_text = "I'll fix it.", .tool = "edit_file", .arguments = "{\"path\":\"README.md\"}" },
@@ -226,6 +246,10 @@ pub fn run(arena: Allocator, config: jev_config.Config, api_key: []const u8, cas
             questions = try sdd_gate.questions(arena, case.rules.len, case.proposal != null);
             state = try sdd_gate.buildState(arena, sddInput(case));
         },
+        .checkpoint => {
+            questions = &checkpoint.questions;
+            state = try checkpoint.buildState(arena, case.previous, case.user_request, case.files);
+        },
         .close => {
             questions = &sdd_gate.close_questions;
             state = try sdd_gate.closeState(arena, case.user_request, case.proposal orelse "", case.assistant_text);
@@ -255,6 +279,7 @@ pub fn run(arena: Allocator, config: jev_config.Config, api_key: []const u8, cas
             (if (v.approves) "approved" else if (v.bug and v.route == .fix) "fix+bug" else @tagName(v.route))
         else |err|
             @errorName(err),
+        .checkpoint => if (checkpoint.evaluate(&response)) |verdict| @tagName(verdict) else "IncompleteJevAnswer",
         .close => if (response.noul(sdd_gate.closes_id)) |p| (if (p >= sdd_gate.close_threshold) "closed" else "open") else "IncompleteJevAnswer",
         .tdd => if (tdd_gate.evaluateNeed(&response)) |need| @tagName(need) else "IncompleteJevAnswer",
     };

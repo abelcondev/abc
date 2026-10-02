@@ -57,6 +57,9 @@ pub const Config = struct {
     /// With SDD on, route the first file change of a turn to fix, spec or
     /// change (`sdd_gate.zig`).
     sdd_gate: bool = true,
+    /// Commit uncommitted, verified work from earlier turns before a new
+    /// request starts separate work (`checkpoint.zig`).
+    checkpoint_gate: bool = true,
     /// Check file changes and shell commands against the request.
     action_gate: bool = false,
     /// Probability of unrequested damage at which an action is held.
@@ -75,7 +78,7 @@ pub const Config = struct {
 
     /// Whether any gate needs the PreToolUse hook.
     pub fn usesPreToolUse(self: Config) bool {
-        return self.plan_gate or self.ask_gate or self.action_gate or self.sdd_gate or self.routes.len != 0;
+        return self.plan_gate or self.ask_gate or self.action_gate or self.sdd_gate or self.checkpoint_gate or self.routes.len != 0;
     }
 
     fn setModel(self: *Config, alloc: Allocator, value: []const u8) !void {
@@ -125,6 +128,9 @@ pub fn applyJson(alloc: Allocator, config: *Config, value: std.json.Value) !void
             }
             if (gates.object.get("sdd")) |sdd| {
                 if (sdd == .bool) config.sdd_gate = sdd.bool;
+            }
+            if (gates.object.get("checkpoint")) |checkpoint_value| {
+                if (checkpoint_value == .bool) config.checkpoint_gate = checkpoint_value.bool;
             }
         }
     }

@@ -43,6 +43,7 @@ const sdd_layout = @import("../sdd/sdd_layout.zig");
 const sdd_gate = @import("sdd_gate.zig");
 const tdd_gate = @import("tdd_gate.zig");
 const receipts = @import("receipts.zig");
+const checkpoint = @import("checkpoint.zig");
 const turn_text = @import("turn_text.zig");
 
 const Allocator = std.mem.Allocator;
@@ -97,6 +98,10 @@ pub const Gate = struct {
     sdd_turn_started: bool = false,
     /// Tool call ids of verification runs already recorded this turn. Owned.
     receipts_seen: std.StringHashMapUnmanaged(void) = .empty,
+    /// Paths already recorded as this turn's work. Owned keys.
+    work_seen: std.StringHashMapUnmanaged(void) = .empty,
+    /// The checkpoint check ran for this turn.
+    checkpoint_settled: bool = false,
     /// Workspace fingerprint taken at this turn's last Stop. Owned.
     turn_fingerprint: ?[]u8 = null,
     /// Decision files already flagged by the drift check. Owned keys.
@@ -132,6 +137,7 @@ pub const Gate = struct {
         self.drift_reported.deinit(self.alloc);
         self.clearReceiptState();
         self.receipts_seen.deinit(self.alloc);
+        self.work_seen.deinit(self.alloc);
         self.config.deinit(self.alloc);
         self.* = undefined;
     }
@@ -314,6 +320,9 @@ pub const Gate = struct {
         var seen = self.receipts_seen.keyIterator();
         while (seen.next()) |key| self.alloc.free(key.*);
         self.receipts_seen.clearRetainingCapacity();
+        var work = self.work_seen.keyIterator();
+        while (work.next()) |key| self.alloc.free(key.*);
+        self.work_seen.clearRetainingCapacity();
         if (self.turn_fingerprint) |hex| self.alloc.free(hex);
         self.turn_fingerprint = null;
     }
@@ -362,6 +371,7 @@ pub const Gate = struct {
         self.sdd_incomplete_held = false;
         self.sdd_approval_checked = false;
         self.sdd_turn_started = false;
+        self.checkpoint_settled = false;
         self.clearReceiptState();
     }
 
@@ -451,6 +461,14 @@ pub const Gate = struct {
             }
             if (config.sdd_gate and std.mem.eql(u8, tool, "shell")) {
                 if (self.checkStatusCommand(input)) |held| break :blk held;
+            }
+            if (config.checkpoint_gate and !self.checkpoint_settled and plan_gate.isFileChange(tool)) {
+                self.checkpoint_settled = true;
+                const checkpoint_action = self.checkCheckpoint(input) catch |err| cp: {
+                    debug_trace.logf("jev", "checkpoint failed err={s}", .{@errorName(err)});
+                    break :cp hooks.PreToolUseAction.continue_;
+                };
+                if (checkpoint_action != .continue_) break :blk checkpoint_action;
             }
             if (config.sdd_gate and plan_gate.isFileChange(tool)) {
                 if (!self.sdd_settled) {
@@ -910,6 +928,9 @@ pub const Gate = struct {
         self.recordReceipts(input) catch |err| {
             debug_trace.logf("jev", "receipts failed err={s}", .{@errorName(err)});
         };
+        if (self.config.checkpoint_gate) self.recordWork(input) catch |err| {
+            debug_trace.logf("jev", "work log failed err={s}", .{@errorName(err)});
+        };
         if (self.config.sdd_gate) {
             const status_action = self.checkSddAtStop(input) catch |err| status: {
                 self.sdd_turn_started = true;
@@ -1014,6 +1035,62 @@ pub const Gate = struct {
             try fresh.append(arena, run);
         }
         receipts.record(self.alloc, session_id, input.invocation.turn_id, hex, fresh.items);
+    }
+
+    /// Appends this turn's request and newly changed paths to the work log.
+    fn recordWork(self: *Gate, input: hooks.StopInput) !void {
+        const session_id = input.invocation.scope.session_id orelse return;
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const paths = try checkpoint.changedPaths(arena, input.invocation.scope.workspace_root, input.turn_messages);
+        var fresh: std.ArrayList([]const u8) = .empty;
+        for (paths) |path| {
+            if (self.work_seen.contains(path)) continue;
+            const key = try self.alloc.dupe(u8, path);
+            errdefer self.alloc.free(key);
+            try self.work_seen.put(self.alloc, key, {});
+            try fresh.append(arena, path);
+        }
+        checkpoint.recordWork(self.alloc, session_id, input.user_request, fresh.items);
+    }
+
+    /// Before the turn's first file change, holds once so the agent commits
+    /// verified earlier work when Jev judges this request separate from it.
+    fn checkCheckpoint(self: *Gate, input: hooks.PreToolUseInput) !hooks.PreToolUseAction {
+        const session_id = input.invocation.scope.session_id orelse return .continue_;
+        const root_path = input.invocation.scope.workspace_root;
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const pending = checkpoint.pendingWork(arena, session_id, root_path) orelse return .continue_;
+        var entry = self.newEntry("checkpoint", input.invocation, checkpoint.threshold);
+        entry.outcome = "skip";
+        const branch = checkpoint.workBranch(arena, root_path) catch |err| {
+            entry.detail = if (err == error.DefaultBranch) "on the default branch" else "not on a branch";
+            decision_log.append(self.alloc, entry);
+            return .continue_;
+        };
+        const hex = receipts.fingerprint(self.alloc, root_path) orelse return .continue_;
+        defer self.alloc.free(hex);
+        if (!checkpoint.verified(receipts.matching(arena, session_id, hex, 8))) {
+            entry.detail = "no passing run on the current code";
+            decision_log.append(self.alloc, entry);
+            return .continue_;
+        }
+        const state = try checkpoint.buildState(self.alloc, pending.requests, input.user_request, pending.paths);
+        defer self.alloc.free(state);
+        var response = self.consult(&entry, state, &checkpoint.questions) orelse return .continue_;
+        defer response.deinit();
+        const verdict = checkpoint.evaluate(&response) orelse {
+            self.logIncomplete(&entry, error.IncompleteJevAnswer);
+            return .continue_;
+        };
+        entry.outcome = @tagName(verdict);
+        entry.detail = branch;
+        decision_log.append(self.alloc, entry);
+        if (verdict == .keep) return .continue_;
+        return .{ .block = self.lend(try checkpoint.holdReason(self.alloc, branch, pending)) };
     }
 
     /// Receipts from earlier turns of this session on exactly the current
