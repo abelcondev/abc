@@ -2066,6 +2066,31 @@ fn runJev(alloc: Allocator, deps: RunDeps, rest: []const [:0]const u8) !RunResul
             try writeStdout(deps, if (action == .on) "Jev decisions are on for new sessions.\n" else "Jev decisions are off.\n");
             return .handled_success;
         },
+        .lite, .full => {
+            var outcome = config_runtime.setUserPreferences(alloc, .{ .jev_mode = @tagName(action) }) catch |err| {
+                const text = try std.fmt.allocPrint(alloc, "fx jev: could not update settings: {s}\n", .{@errorName(err)});
+                defer alloc.free(text);
+                try writeStderr(deps, text);
+                return .handled_failure;
+            };
+            outcome.deinit(alloc);
+            try writeStdout(deps, if (action == .lite) "Jev mode is lite for new sessions.\n" else "Jev mode is full for new sessions.\n");
+            return .handled_success;
+        },
+        .iris => {
+            const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+            defer alloc.free(workspace_root);
+            const enabled = parsed.iris.?;
+            var outcome = config_runtime.setWorkspaceIris(alloc, workspace_root, enabled) catch |err| {
+                const text = try std.fmt.allocPrint(alloc, "fx jev: could not update settings: {s}\n", .{@errorName(err)});
+                defer alloc.free(text);
+                try writeStderr(deps, text);
+                return .handled_failure;
+            };
+            outcome.deinit(alloc);
+            try writeStdout(deps, if (enabled) "Iris checks are on for this workspace.\n" else "Iris checks are off for this workspace.\n");
+            return .handled_success;
+        },
         .key => {
             const key = readConnectionKey(alloc, deps, "TypeSafe (Jev)") catch |err| {
                 const text = try std.fmt.allocPrint(alloc, "fx jev: could not read the key: {s}\n", .{@errorName(err)});

@@ -456,6 +456,20 @@ fn applyStopAction(
             trace.finish("continue_once");
             return .{ .done = .{ .continue_once = context } };
         },
+        .note => |borrowed| {
+            if (borrowed.len > definitions.Limits.context_bytes or
+                !std.unicode.utf8ValidateSlice(borrowed))
+            {
+                trace.finish("invalid_note");
+                return .{ .done = .allow };
+            }
+            const text = alloc.dupe(u8, borrowed) catch {
+                trace.finish("copy_failed");
+                return .{ .done = .allow };
+            };
+            trace.finish("note");
+            return .{ .done = .{ .note = text } };
+        },
     }
 }
 

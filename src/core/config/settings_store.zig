@@ -91,12 +91,14 @@ pub const ProjectMcpMutation = struct {
     action: project_config.ProjectMcpAction,
 };
 
-/// Writes `workspaces["<root>"].sdd.enabled` and `.tdd`.
+/// Writes `workspaces["<root>"].sdd.enabled` and `.tdd`, and the
+/// workspace's Iris switch `workspaces["<root>"].iris`.
 pub const WorkspaceSddMutation = struct {
     workspace_root: []const u8,
     enabled: ?bool = null,
-    /// `off`, `on` or `strict`.
+    /// `off`, `auto`, `on` or `strict`.
     tdd: ?[]const u8 = null,
+    iris: ?bool = null,
 };
 
 pub const UserSettingsPatch = struct {
@@ -122,6 +124,8 @@ pub const UserSettingsPatch = struct {
     notification_max: ?bool = null,
     /// Writes `jev.enabled`.
     jev_enabled: ?bool = null,
+    /// Writes `jev.mode` (`lite` or `full`).
+    jev_mode: ?[]const u8 = null,
 
     fn isEmpty(self: UserSettingsPatch) bool {
         return self.model_preference == null and
@@ -142,7 +146,8 @@ pub const UserSettingsPatch = struct {
             self.notification_turn_end == null and
             self.notification_attention_required == null and
             self.notification_max == null and
-            self.jev_enabled == null;
+            self.jev_enabled == null and
+            self.jev_mode == null;
     }
 };
 
@@ -1014,6 +1019,12 @@ test "workspace sdd mutation writes only that workspace's sdd switch" {
     try std.testing.expectEqualStrings("strict", sdd.get("tdd").?.string);
     try std.testing.expect(sdd.get("enabled").?.bool);
     try std.testing.expectError(error.InvalidDurableField, validateMutation(.{ .workspace_sdd = .{ .workspace_root = "/repo", .tdd = "always" } }));
+
+    const iris = try applyWorkspaceSddMutationToRoot(arena.allocator(), &root, .{ .workspace_root = "/repo", .iris = false });
+    try std.testing.expect(iris.changed);
+    const repo = root.object.get("workspaces").?.object.get("/repo").?.object;
+    try std.testing.expect(!repo.get("iris").?.bool);
+    try std.testing.expectEqualStrings("strict", repo.get("sdd").?.object.get("tdd").?.string);
 }
 
 test "model and fast patch binds the fast preference atomically" {
@@ -1113,6 +1124,17 @@ fn applyUserPatchToRoot(
             break :blk root.object.getPtr("jev").?;
         };
         application.changed = try putBool(arena, &jev.object, "enabled", enabled) or application.changed;
+    }
+
+    if (patch.jev_mode) |mode| {
+        var jev = if (root.object.getPtr("jev")) |value| blk: {
+            if (value.* != .object) return error.InvalidSettingsFormat;
+            break :blk value;
+        } else blk: {
+            try root.object.put(arena, "jev", .{ .object = .empty });
+            break :blk root.object.getPtr("jev").?;
+        };
+        application.changed = try putString(arena, &jev.object, "mode", mode) or application.changed;
     }
 
     if (patch.statusline_item) |item_patch| {
@@ -1546,6 +1568,9 @@ fn applyWorkspaceSddMutationToRoot(
     mutation: WorkspaceSddMutation,
 ) !PatchApplication {
     const workspace = try workspaceObject(arena, root, mutation.workspace_root);
+    var changed = false;
+    if (mutation.iris) |iris| changed = try putBool(arena, workspace, "iris", iris) or changed;
+    if (mutation.enabled == null and mutation.tdd == null) return .{ .changed = changed };
     var sdd = if (workspace.getPtr("sdd")) |value| blk: {
         if (value.* != .object) return error.InvalidSettingsFormat;
         break :blk value;
@@ -1553,7 +1578,6 @@ fn applyWorkspaceSddMutationToRoot(
         try workspace.put(arena, "sdd", .{ .object = .empty });
         break :blk workspace.getPtr("sdd").?;
     };
-    var changed = false;
     if (mutation.enabled) |enabled| changed = try putBool(arena, &sdd.object, "enabled", enabled) or changed;
     if (mutation.tdd) |tdd| changed = try putString(arena, &sdd.object, "tdd", tdd) or changed;
     return .{ .changed = changed };

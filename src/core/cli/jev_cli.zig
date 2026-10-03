@@ -1,7 +1,8 @@
 //! `fx jev`: inspect and configure Jev decisions.
 //!
 //! `fx jev` prints the status, `on`/`off` persist `jev.enabled` in the
-//! profile settings, `key` saves the TypeSafe API key, `forget` removes it,
+//! profile settings, `lite`/`full` persist `jev.mode`, `iris on|off` saves
+//! `workspaces["<root>"].iris` for the current workspace, `key` saves the TypeSafe API key, `forget` removes it,
 //! and `check` makes one live call to confirm the key and endpoint work.
 
 const std = @import("std");
@@ -13,11 +14,12 @@ const drift_mod = @import("../decisions/drift.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const Action = enum { status, on, off, key, forget, check, eval, drift };
+pub const Action = enum { status, on, off, lite, full, iris, key, forget, check, eval, drift };
 
 pub const usage =
-    \\usage: fx jev [on|off|key|forget|check]
-    \\       fx jev eval [stop|plan|action|ask|routing|sdd|close|tdd|checkpoint|review|visual|drift|edits|memory]
+    \\usage: fx jev [on|off|lite|full|key|forget|check]
+    \\       fx jev iris on|off
+    \\       fx jev eval [plan|action|ask|routing|sdd|close|tdd|visual|drift|edits|memory]
     \\       fx jev drift [<git-range>] [--dir <decisions-dir>]
     \\
 ;
@@ -26,7 +28,16 @@ pub const Parsed = struct {
     action: Action,
     /// `eval` gate filter.
     gate: ?calibration.Gate = null,
+    /// `iris` switch.
+    iris: ?bool = null,
 };
+
+/// Parses `on` or `off`.
+pub fn parseSwitch(word: []const u8) ?bool {
+    if (std.mem.eql(u8, word, "on")) return true;
+    if (std.mem.eql(u8, word, "off")) return false;
+    return null;
+}
 
 pub const DriftOptions = struct {
     /// Passed to `git diff`; `HEAD` compares uncommitted changes.
@@ -102,6 +113,10 @@ pub fn parseAction(rest: []const [:0]const u8) ?Parsed {
     if (action == .eval and rest.len == 2) {
         return .{ .action = .eval, .gate = calibration.parseGate(rest[1]) orelse return null };
     }
+    if (action == .iris) {
+        if (rest.len != 2) return null;
+        return .{ .action = .iris, .iris = parseSwitch(rest[1]) orelse return null };
+    }
     if (rest.len != 1) return null;
     return .{ .action = action };
 }
@@ -154,6 +169,7 @@ pub fn renderStatus(alloc: Allocator, config: jev_config.Config, key: KeyStatus,
     errdefer out.deinit();
     const w = &out.writer;
     try w.print("Jev decisions: {s}\n", .{if (config.enabled) "on" else "off"});
+    try w.print("  mode      {s}\n", .{@tagName(config.mode)});
     try w.print("  model     {s}\n", .{config.model});
     try w.print("  endpoint  {s}\n", .{config.base_url});
     switch (key) {
@@ -174,21 +190,13 @@ pub fn renderStatus(alloc: Allocator, config: jev_config.Config, key: KeyStatus,
     if (config.sdd_gate) {
         try w.print("  {s}route file changes to fix, spec or change (with SDD on)\n", .{label});
         label = indent;
-        try w.print("  {s}test-first behavior changes (with SDD on; Jev decides under `tdd auto`)\n", .{label});
-    }
-    if (config.checkpoint_gate) {
-        try w.print("  {s}commit verified earlier work before separate new work (off the default branch)\n", .{label});
-        label = indent;
-    }
-    if (config.review_gate) {
-        try w.print("  {s}review before a risky or large pull request opens\n", .{label});
-        label = indent;
+        try w.print("  {s}test-first behavior changes (with SDD and `tdd` on; Jev decides under `tdd auto`)\n", .{label});
     }
     if (config.visual_gate) {
         if (config.visual_model) |model| {
-            try w.print("  {s}Iris screenshot after visual changes (vision subagent: {s})\n", .{ label, model });
+            try w.print("  {s}Iris screenshot after visual changes (vision subagent: {s}; per workspace: `fx jev iris on|off`)\n", .{ label, model });
         } else {
-            try w.print("  {s}Iris screenshot after visual changes\n", .{label});
+            try w.print("  {s}Iris screenshot after visual changes (per workspace: `fx jev iris on|off`)\n", .{label});
         }
         label = indent;
     }
@@ -206,10 +214,6 @@ pub fn renderStatus(alloc: Allocator, config: jev_config.Config, key: KeyStatus,
     }
     if (config.action_gate) {
         try w.print("  {s}action check (hold at damage {d:.2})\n", .{ label, config.action_threshold });
-        label = indent;
-    }
-    if (config.stop_gate) {
-        try w.print("  {s}completion check (threshold {d:.2})\n", .{ label, config.stop_threshold });
         label = indent;
     }
     if (label.ptr != indent.ptr) try w.writeAll("  gates     none\n");
@@ -255,6 +259,10 @@ test "parseAction accepts the documented subcommands" {
     try std.testing.expect(parseAction(&.{"enable"}) == null);
     try std.testing.expect(parseAction(&.{"status"}) == null);
     try std.testing.expect(parseAction(&.{ "on", "now" }) == null);
+    try std.testing.expectEqual(Action.lite, parseAction(&.{"lite"}).?.action);
+    try std.testing.expectEqual(@as(?bool, false), parseAction(&.{ "iris", "off" }).?.iris);
+    try std.testing.expect(parseAction(&.{"iris"}) == null);
+    try std.testing.expect(parseAction(&.{ "iris", "maybe" }) == null);
 }
 
 test "parseDrift reads a range and a decisions directory" {
@@ -277,14 +285,16 @@ test "renderStatus reports configuration without the key value" {
     try std.testing.expect(std.mem.find(u8, off, "fx jev key") != null);
     try std.testing.expect(std.mem.find(u8, off, "fx jev on") != null);
 
-    const on = try renderStatus(alloc, .{ .enabled = true, .stop_threshold = 0.6 }, .{ .saved = "macOS Keychain" }, "fx jev on");
+    const on = try renderStatus(alloc, .{ .enabled = true }, .{ .saved = "macOS Keychain" }, "fx jev on");
     defer alloc.free(on);
     try std.testing.expect(std.mem.find(u8, on, "saved in the macOS Keychain") != null);
     try std.testing.expect(std.mem.find(u8, on, "gates     answer settled questions (threshold 0.80)") != null);
-    try std.testing.expect(std.mem.find(u8, on, "plan before changes (threshold 0.50)") != null);
+    try std.testing.expect(std.mem.find(u8, on, "mode      lite") != null);
+    try std.testing.expect(std.mem.find(u8, on, "plan before changes") == null);
+    try std.testing.expect(std.mem.find(u8, on, "Iris screenshot") == null);
     try std.testing.expect(std.mem.find(u8, on, "action check") == null);
     try std.testing.expect(std.mem.find(u8, on, "route file changes to fix, spec or change (with SDD on)") != null);
     try std.testing.expect(std.mem.find(u8, on, "test-first behavior changes") != null);
-    try std.testing.expect(std.mem.find(u8, on, "completion check (threshold 0.60)") != null);
+    try std.testing.expect(std.mem.find(u8, on, "completion check") == null);
     try std.testing.expect(std.mem.find(u8, on, "fx jev on") == null);
 }

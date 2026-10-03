@@ -34,9 +34,10 @@ independiente que mantiene al agente honesto.
   las rarezas de los modelos que no son de OpenAI (finish reasons extraños,
   `[DONE]` que falta, tool deltas sin índice) que rompen los tool calls y los
   subagentes en otros agentes.
-- **Una segunda opinión en cada turno.** Jev comprueba que los cambios grandes
-  tengan un plan, que "listo" signifique listo y que cada afirmación esté
-  respaldada por la salida real de las herramientas.
+- **Liviano por defecto.** Jev (opcional) solo interviene donde ahorra una vuelta
+  del modelo: responde preguntas que el código ya resuelve y frena ediciones
+  con scripts frágiles. Los chequeos que cuestan una vuelta (plan, drift, Iris)
+  se activan con `fx jev full` o por proyecto.
 - **Specs siempre al día.** SDD (opcional) mantiene una carpeta `sdd/` liviana
   con reglas y propuestas de cambio, y avisa cuando el código las contradice.
 - **Nativo y rápido.** Un solo binario en Zig que arranca en milisegundos. Las
@@ -86,7 +87,7 @@ Para actualizar más adelante: `fx update`.
               │    └── resultados: archivos, shell, web, subagentes
               ▼
         permisos         ← qué puede hacer el agente sin preguntarte
-        Jev (opcional)   ← ¿hay un plan? ¿está realmente terminado?
+        Jev (opcional)   ← ¿el código ya responde la pregunta? ¿edición segura?
         SDD (opcional)   ← ¿este cambio necesita una spec o una propuesta?
 ```
 
@@ -175,8 +176,8 @@ redes privadas (RFC 1918, Tailscale, `.local`). Todos los campos están en
 
 [Jev](https://docs.typesafe.ai) es el modelo de decisiones de TypeSafe AI.
 **No escribe código.** Responde preguntas cortas y tipadas ("¿este plan está
-completo?", "¿cada afirmación está respaldada por un resultado de herramienta?")
-con probabilidades calibradas. fx le pregunta en momentos clave de cada turno,
+completo?", "¿el contexto ya responde esta pregunta?") con probabilidades
+calibradas. fx le pregunta en momentos clave de cada turno,
 así un segundo modelo, independiente, revisa el trabajo del modelo principal.
 
 ### Qué hace Jev en un turno
@@ -203,9 +204,6 @@ así un segundo modelo, independiente, revisa el trabajo del modelo principal.
  │     └─► ROUTING: Jev elige un modelo liviano o potente         │
  │                                                                │
  │  el agente dice "listo"                                        │
- │     ├─► STOP:  ¿el trabajo está hecho? ¿las afirmaciones       │
- │     │          tienen respaldo en la salida de herramientas?   │
- │     │          si no, el agente sigue una vez y lo verifica    │
  │     └─► DRIFT: (si SDD está activo) ¿el código contradice una  │
  │                regla de la spec? el agente la actualiza        │
  └────────────────────────────────────────────────────────────────┘
@@ -214,21 +212,31 @@ así un segundo modelo, independiente, revisa el trabajo del modelo principal.
  respuesta
 ```
 
-En palabras simples:
+Jev tiene dos modos. **`lite`** (por defecto) deja solo los chequeos que
+ahorran tiempo; **`full`** suma los que cuestan una vuelta más del modelo:
+
+```bash
+fx jev lite      # por defecto
+fx jev full      # suma plan, drift e Iris
+```
+
+En palabras simples (la columna indica el valor en `lite`):
 
 | Chequeo | Qué evita | Por defecto |
 | --- | --- | --- |
-| **Plan** | Cambios grandes sin un plan claro. Los pedidos chicos pasan. Frena como máximo dos veces por turno. | activo |
+| **Plan** | Cambios grandes sin un plan claro. Los pedidos chicos pasan. Frena como máximo dos veces por turno. | inactivo (activo en `full`) |
 | **Ask** | Que te pregunte cosas que el código ya responde (por ejemplo, una versión fijada). Las preferencias te siguen llegando a ti. | activo |
-| **Stop** | "¡Listo!" cuando no está listo, o afirmaciones ("los tests pasan") que ninguna salida muestra. | activo |
-| **Drift** | Specs y registros de decisiones desactualizados tras un cambio. Jev también decide qué lado corregir: si tu pedido pidió ese cambio, se actualiza la spec; si vino de arrastre, se arregla el código (sin tocar cambios tuyos previos sin commitear); si no está claro, el agente te pregunta. Solo con SDD activo. | activo |
+| **Drift** | Specs y registros de decisiones desactualizados tras un cambio. Jev también decide qué lado corregir: si tu pedido pidió ese cambio, se actualiza la spec; si vino de arrastre, se arregla el código (sin tocar cambios tuyos previos sin commitear); si no está claro, el agente te pregunta. Solo con SDD activo. | inactivo (activo en `full`) |
 | **Ruteo SDD** | Cambios grandes sin propuesta. Solo con SDD activo. | activo |
-| **Checkpoint** | Mezclar trabajos distintos en un solo commit. Cuando un pedido nuevo no es parte del trabajo sin commitear de turnos anteriores, el agente commitea primero ese trabajo (solo sus archivos, sin push). Solo fuera de la rama principal y con tests o build en verde sobre el código actual. | activo |
-| **Review** | Abrir un PR riesgoso sin revisarlo. Antes de `gh pr create` o `gh pr ready`, Jev califica el diff de la rama (bajo, medio o alto). Uno alto, o uno medio de 400 líneas o más, se frena una vez por rama para revisarlo, refutar cada hallazgo contra el código, arreglar los que quedan y listarlos en el PR. | activo |
-| **Visual** | Dar por bueno un cambio de interfaz sin mirarlo. Si el turno cambió archivos de UI y Jev juzga que el cambio se ve en pantalla, el agente saca una captura con [Iris](https://github.com/brijr/iris) y la compara con el pedido. Sin Iris configurado, fx avisa una vez que se saltó el chequeo. | activo |
+| **Visual** | Dar por bueno un cambio de interfaz sin mirarlo. Si el turno cambió archivos de UI y Jev juzga que el cambio se ve en pantalla, el agente saca una captura con [Iris](https://github.com/brijr/iris) y la compara con el pedido. Sin Iris configurado, fx avisa una vez que se saltó el chequeo. Se prende o apaga por proyecto con `fx jev iris on\|off`. | inactivo (activo en `full`) |
 | **Edits** | Editar unos pocos archivos con `sed -i`, `perl -pi` o un script de Python, que se saltean el chequeo exacto de `edit_file` y pueden cortar código sin que se note. Si Jev ve un cambio puntual, se frena una vez por turno para usar `edit_file`; los renombres mecánicos en muchos archivos, o un script que pediste, pasan. | activo |
 | **Action** | Borrar, sobrescribir, publicar o salir del proyecto sin que lo pidas. Suma ~0,5 s por llamada. | inactivo |
 | **Routing** | Usar un modelo caro para una tarea trivial de un subagente. | inactivo |
+
+Al final de cada turno, sin consultar a ningún modelo, fx muestra una línea si
+la respuesta dice que los tests pasan pero ninguna corrida que pase vino
+después del último cambio de código. El agente no vuelve a trabajar por eso: la
+línea es solo para ti.
 
 Jev no reemplaza el sistema de permisos, se suma a él. Las llamadas frenadas
 aparecen como "Held" en el transcript, no como "Failed". Si Jev no responde o
@@ -242,11 +250,12 @@ Consigue una key en [TypeSafe AI](https://docs.typesafe.ai) y luego:
 fx jev key       # pega la key (se guarda en el Keychain)
 fx jev check     # una llamada real para confirmar que funciona
 fx jev on        # lo activa para las sesiones nuevas
-fx jev           # estado: chequeos, umbrales, origen de la key
+fx jev           # estado: modo, chequeos, umbrales, origen de la key
 fx jev off       # lo desactiva
 ```
 
-Dentro de una sesión, `/jev on` y `/jev off` lo cambian y guardan la elección.
+Dentro de una sesión, `/jev on`, `/jev off`, `/jev lite`, `/jev full` y
+`/jev iris on|off` hacen lo mismo y guardan la elección.
 
 **Opcional: ruteo de modelos.** Deja que Jev elija el modelo del subagente
 según la tarea:
@@ -271,6 +280,14 @@ servidor MCP llamado `iris` en `~/.fx/mcp.json`:
 }
 ```
 
+Después, actívala en los proyectos donde la quieras (en `full` ya viene activa
+y se puede apagar por proyecto):
+
+```bash
+fx jev iris on   # guarda workspaces["<ruta>"].iris para este proyecto
+fx jev iris off
+```
+
 Iris no inicia sesión ni hace clics, así que conviene capturar el servidor de
 desarrollo o una ruta de preview solo de desarrollo con datos de ejemplo. Si el
 modelo de la sesión no lee imágenes, `"jev": { "visual": { "model": "<modelo con visión>" } }`
@@ -281,15 +298,6 @@ specs o registros de decisiones y termina con error si alguno puede estar
 desactualizado.
 
 Cada decisión de Jev queda registrada en `~/.fx/sessions/<id>/decisions.jsonl`.
-
-**Recibos de verificación.** Al terminar cada turno, fx guarda en
-`~/.fx/sessions/<id>/receipts.jsonl` las corridas de tests y de build que
-vinieron después del último cambio de archivos, junto con una huella del código
-(el commit actual más el contenido de cada archivo cambiado o nuevo, sin contar
-`sdd/`). En los turnos siguientes, el chequeo de terminado acepta esas corridas
-como respaldo mientras la huella no cambie: "los tests pasan" de hace tres
-turnos sigue valiendo hasta que se toque el código, y una corrida que falló
-nunca respalda un "todo en verde".
 
 Todas las opciones están en [Configuración de Jev](#configuración-de-jev).
 
@@ -395,10 +403,10 @@ TDD es un complemento de SDD. Con él, los cambios de comportamiento (rutas spec
 y change, y arreglos de bugs) tienen que empezar con un test que falle.
 
 ```bash
-fx sdd tdd auto     # por defecto: Jev decide en cada pedido si va primero el test
+fx sdd tdd off      # por defecto
+fx sdd tdd auto     # Jev decide en cada pedido si va primero el test
 fx sdd tdd on       # primero el test, siempre
 fx sdd tdd strict   # además: cada regla cambiada debe citarse en un test
-fx sdd tdd off
 ```
 
 En modo **auto**, antes del primer cambio de código del turno Jev clasifica el
@@ -486,7 +494,7 @@ respuesta, gestor de paquetes, dónde viven los tests).
 | Proveedor, modelo, permisos, Jev | `~/.fx/settings.json` | `FX_PROVIDER`, `FX_MODEL`, `FX_PERMISSION_MODE`, `FX_JEV=on\|off` |
 | SDD y TDD, por proyecto | `~/.fx/settings.json` → `workspaces["<ruta>"].sdd` | `FX_SDD=on\|off` |
 | Valores del proyecto que se pueden commitear | `<proyecto>/.fx.json` | |
-| Sesiones, registro de decisiones, recibos y trabajo de Jev | `~/.fx/sessions/<id>/` (`decisions.jsonl`, `receipts.jsonl`, `work.jsonl`) | |
+| Sesiones y registro de decisiones de Jev | `~/.fx/sessions/<id>/` (`decisions.jsonl`) | |
 | Memoria del workspace | `~/.fx/memory/<workspace>/` (`MEMORY.md` y un archivo por hecho) | `FX_MEMORY=on\|off` |
 
 Fuera de macOS, las keys guardadas van a un archivo privado en
@@ -542,26 +550,23 @@ Dentro de `jev` en `~/.fx/settings.json`:
 | Campo | Significado |
 | --- | --- |
 | `enabled` | Activa las decisiones de Jev (por defecto `false`) |
+| `mode` | `lite` (por defecto) o `full`; define los valores por defecto de `gates.plan`, `gates.drift` y `gates.visual` |
 | `model` | Modelo de Jev (por defecto `jev-latest`) |
 | `gates.ask` | Deja que Jev responda preguntas que el contexto ya resuelve (por defecto `true`) |
-| `gates.plan` | Exige un plan antes de cambios en pedidos grandes (por defecto `true`) |
-| `gates.drift` | Marca registros de decisiones que el cambio contradice (por defecto `true`) |
+| `gates.plan` | Exige un plan antes de cambios en pedidos grandes (`false` en `lite`, `true` en `full`) |
+| `gates.drift` | Marca registros de decisiones que el cambio contradice (`false` en `lite`, `true` en `full`) |
 | `gates.sdd` | Con SDD activo, clasifica el primer cambio como fix, spec o change (por defecto `true`) |
-| `gates.checkpoint` | Commitea el trabajo verificado de turnos anteriores antes de empezar un trabajo distinto (por defecto `true`) |
-| `gates.review` | Pide una revisión antes de abrir un PR riesgoso o grande (por defecto `true`) |
-| `gates.visual` | Pide una captura con Iris después de cambios visuales (por defecto `true`) |
+| `gates.visual` | Pide una captura con Iris después de cambios visuales (`false` en `lite`, `true` en `full`); `workspaces["<ruta>"].iris` lo sobrescribe por proyecto |
 | `visual.model` | Modelo con visión para un subagente que mira la captura cuando el modelo de la sesión no lee imágenes |
 | `gates.edits` | Frena ediciones puntuales hechas con scripts para usar `edit_file` (por defecto `true`) |
 | `gates.memory` | Revisa que un hecho nuevo de memoria valga la pena y no repita otro (por defecto `true`) |
 | `gates.action` | Revisa cambios de archivos y comandos de shell (por defecto `false`) |
-| `gates.stop` | Corre el chequeo de finalización (por defecto `true`) |
 | `thresholds.ask` | Confianza y respaldo mínimos para responder (por defecto `0.8`) |
 | `thresholds.plan` | Probabilidad mínima que deben alcanzar los chequeos del plan (por defecto `0.5`) |
 | `thresholds.action` | Probabilidad de daño no pedido que frena una acción (por defecto `0.6`) |
-| `thresholds.stop` | Probabilidad mínima de cada chequeo de finalización (por defecto `0.5`) |
 | `routing.<nombre>` | `model`, `effort` opcional y `description` de una ruta de subagente |
 
-`TYPESAFE_API_KEY`, `FX_JEV=on|off`, `FX_JEV_MODEL` y `FX_JEV_BASE_URL`
+`TYPESAFE_API_KEY`, `FX_JEV=on|off`, `FX_JEV_MODE=lite|full`, `FX_JEV_MODEL` y `FX_JEV_BASE_URL`
 sobrescriben los valores guardados.
 
 Rutas: `light` y `heavy` traen descripción incluida; otros nombres necesitan
@@ -573,14 +578,14 @@ archivo Markdown por decisión en `sdd/decisions`, `docs/decisions`, `docs/adr`
 o `decisions` (front matter `title`/`status`/`description` opcional). Cada
 registro se marca una vez por sesión.
 
-`fx jev eval [stop|plan|action|ask|routing|sdd|close|tdd|checkpoint|review|visual|drift|edits|memory]` corre casos etiquetados con las
+`fx jev eval [plan|action|ask|routing|sdd|close|tdd|visual|drift|edits|memory]` corre casos etiquetados con las
 mismas preguntas y umbrales que los chequeos reales, para probar cambios de
 umbral o de modelo antes de usarlos.
 
 ### Configuración de SDD
 
 Por proyecto en `~/.fx/settings.json` → `workspaces["<ruta>"].sdd`: `enabled`,
-`tdd` (`off`, `auto`, `on`, `strict`; `auto` por defecto) y `test` (un comando de tests propio). Un
+`tdd` (`off`, `auto`, `on`, `strict`; `off` por defecto) y `test` (un comando de tests propio). Un
 `"sdd": {"enabled": true}` en el nivel superior define el valor por defecto
 para todos los proyectos. `FX_SDD=on|off` lo sobrescribe para una shell o una
 ejecución de CI.
